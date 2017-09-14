@@ -47,17 +47,18 @@ var constructors = map[string]typeSpec{}
 // Config - The all encompassing configuration struct for all input types. Note that some configs
 // are empty structs, as the type has no optional values but we want to list it as an option.
 type Config struct {
-	Type       string           `json:"type" yaml:"type"`
-	HTTPServer HTTPServerConfig `json:"http_server" yaml:"http_server"`
-	ScaleProto ScaleProtoConfig `json:"scalability_protocols" yaml:"scalability_protocols"`
-	ZMQ4       *ZMQ4Config      `json:"zmq4,omitempty" yaml:"zmq4,omitempty"`
-	Kafka      KafkaConfig      `json:"kafka" yaml:"kafka"`
-	AMQP       AMQPConfig       `json:"amqp" yaml:"amqp"`
-	NSQ        NSQConfig        `json:"nsq" yaml:"nsq"`
-	NATS       NATSConfig       `json:"nats" yaml:"nats"`
-	File       FileConfig       `json:"file" yaml:"file"`
-	STDIN      STDINConfig      `json:"stdin" yaml:"stdin"`
-	FanIn      FanInConfig      `json:"fan_in" yaml:"fan_in"`
+	Type       string                 `json:"type" yaml:"type"`
+	HTTPServer HTTPServerConfig       `json:"http_server" yaml:"http_server"`
+	HTTPStream HTTPStreamClientConfig `json:"http_stream_client" yaml:"http_stream_client"`
+	ScaleProto ScaleProtoConfig       `json:"scalability_protocols" yaml:"scalability_protocols"`
+	ZMQ4       *ZMQ4Config            `json:"zmq4,omitempty" yaml:"zmq4,omitempty"`
+	Kafka      KafkaConfig            `json:"kafka" yaml:"kafka"`
+	AMQP       AMQPConfig             `json:"amqp" yaml:"amqp"`
+	NSQ        NSQConfig              `json:"nsq" yaml:"nsq"`
+	NATS       NATSConfig             `json:"nats" yaml:"nats"`
+	File       FileConfig             `json:"file" yaml:"file"`
+	STDIN      STDINConfig            `json:"stdin" yaml:"stdin"`
+	FanIn      FanInConfig            `json:"fan_in" yaml:"fan_in"`
 }
 
 // NewConfig - Returns a configuration struct fully populated with default values.
@@ -65,6 +66,7 @@ func NewConfig() Config {
 	return Config{
 		Type:       "stdin",
 		HTTPServer: NewHTTPServerConfig(),
+		HTTPStream: NewHTTPStreamClientConfig(),
 		ScaleProto: NewScaleProtoConfig(),
 		ZMQ4:       NewZMQ4Config(),
 		Kafka:      NewKafkaConfig(),
