@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 //------------------------------------------------------------------------------
@@ -42,7 +42,7 @@ func TestRoundRobinInterfaces(t *testing.T) {
 }
 
 func TestRoundRobinDoubleClose(t *testing.T) {
-	oTM, err := NewRoundRobin([]types.Consumer{}, metrics.DudType{})
+	oTM, err := NewRoundRobin([]types.Output{}, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -58,34 +58,26 @@ func TestRoundRobinDoubleClose(t *testing.T) {
 func TestBasicRoundRobin(t *testing.T) {
 	nMsgs := 1000
 
-	outputs := []types.Consumer{}
+	outputs := []types.Output{}
 	mockOutputs := []*MockOutputType{
-		{
-			ResChan: make(chan types.Response),
-			MsgChan: make(chan types.Message),
-		},
-		{
-			ResChan: make(chan types.Response),
-			MsgChan: make(chan types.Message),
-		},
-		{
-			ResChan: make(chan types.Response),
-			MsgChan: make(chan types.Message),
-		},
+		{},
+		{},
+		{},
 	}
 
 	for _, o := range mockOutputs {
 		outputs = append(outputs, o)
 	}
 
-	readChan := make(chan types.Message)
+	readChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
 
 	oTM, err := NewRoundRobin(outputs, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	if err = oTM.StartReceiving(readChan); err != nil {
+	if err = oTM.Consume(readChan); err != nil {
 		t.Error(err)
 		return
 	}
@@ -93,37 +85,40 @@ func TestBasicRoundRobin(t *testing.T) {
 	for i := 0; i < nMsgs; i++ {
 		content := [][]byte{[]byte(fmt.Sprintf("hello world %v", i))}
 		select {
-		case readChan <- types.Message{Parts: content}:
+		case readChan <- types.NewTransaction(types.NewMessage(content), resChan):
 		case <-time.After(time.Second):
 			t.Errorf("Timed out waiting for broker send")
 			return
 		}
 
-		select {
-		case msg := <-mockOutputs[i%3].MsgChan:
-			if string(msg.Parts[0]) != string(content[0]) {
-				t.Errorf("Wrong content returned %s != %s", msg.Parts[0], content[0])
+		go func() {
+			var ts types.Transaction
+			select {
+			case ts = <-mockOutputs[i%3].TChan:
+				if string(ts.Payload.Get(0)) != string(content[0]) {
+					t.Errorf("Wrong content returned %s != %s", ts.Payload.Get(0), content[0])
+				}
+			case <-mockOutputs[(i+1)%3].TChan:
+				t.Errorf("Received message in wrong order: %v != %v", i%3, (i+1)%3)
+				return
+			case <-mockOutputs[(i+2)%3].TChan:
+				t.Errorf("Received message in wrong order: %v != %v", i%3, (i+2)%3)
+				return
+			case <-time.After(time.Second):
+				t.Errorf("Timed out waiting for broker propagate")
+				return
 			}
-		case <-mockOutputs[(i+1)%3].MsgChan:
-			t.Errorf("Received message in wrong order: %v != %v", i%3, (i+1)%3)
-			return
-		case <-mockOutputs[(i+2)%3].MsgChan:
-			t.Errorf("Received message in wrong order: %v != %v", i%3, (i+2)%3)
-			return
-		case <-time.After(time.Second):
-			t.Errorf("Timed out waiting for broker propagate")
-			return
-		}
+
+			select {
+			case ts.ResponseChan <- types.NewSimpleResponse(nil):
+			case <-time.After(time.Second):
+				t.Errorf("Timed out responding to broker")
+				return
+			}
+		}()
 
 		select {
-		case mockOutputs[i%3].ResChan <- types.NewSimpleResponse(nil):
-		case <-time.After(time.Second):
-			t.Errorf("Timed out responding to broker")
-			return
-		}
-
-		select {
-		case res := <-oTM.ResponseChan():
+		case res := <-resChan:
 			if res.Error() != nil {
 				t.Errorf("Received unexpected errors from broker: %v", res.Error())
 			}
@@ -132,6 +127,11 @@ func TestBasicRoundRobin(t *testing.T) {
 			return
 		}
 	}
+
+	oTM.CloseAsync()
+	if err := oTM.WaitForClose(time.Second * 10); err != nil {
+		t.Error(err)
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -139,25 +139,23 @@ func TestBasicRoundRobin(t *testing.T) {
 func BenchmarkBasicRoundRobin(b *testing.B) {
 	nOutputs, nMsgs := 3, b.N
 
-	outputs := []types.Consumer{}
+	outputs := []types.Output{}
 	mockOutputs := []*MockOutputType{}
 
 	for i := 0; i < nOutputs; i++ {
-		mockOutputs = append(mockOutputs, &MockOutputType{
-			ResChan: make(chan types.Response),
-			MsgChan: make(chan types.Message),
-		})
+		mockOutputs = append(mockOutputs, &MockOutputType{})
 		outputs = append(outputs, mockOutputs[i])
 	}
 
-	readChan := make(chan types.Message)
+	readChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
 
 	oTM, err := NewRoundRobin(outputs, metrics.DudType{})
 	if err != nil {
 		b.Error(err)
 		return
 	}
-	if err = oTM.StartReceiving(readChan); err != nil {
+	if err = oTM.Consume(readChan); err != nil {
 		b.Error(err)
 		return
 	}
@@ -167,10 +165,10 @@ func BenchmarkBasicRoundRobin(b *testing.B) {
 	b.StartTimer()
 
 	for i := 0; i < nMsgs; i++ {
-		readChan <- types.Message{Parts: content}
-		<-mockOutputs[i%3].MsgChan
-		mockOutputs[i%3].ResChan <- types.NewSimpleResponse(nil)
-		res := <-oTM.ResponseChan()
+		readChan <- types.NewTransaction(types.NewMessage(content), resChan)
+		ts := <-mockOutputs[i%3].TChan
+		ts.ResponseChan <- types.NewSimpleResponse(nil)
+		res := <-resChan
 		if res.Error() != nil {
 			b.Errorf("Received unexpected errors from broker: %v", res.Error())
 		}

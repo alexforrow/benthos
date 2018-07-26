@@ -22,19 +22,20 @@ package processor
 
 import (
 	"os"
+	"reflect"
 	"testing"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 func TestSample10Percent(t *testing.T) {
 	conf := NewConfig()
-	conf.Sample.Retain = 0.1
+	conf.Sample.Retain = 10.0
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewSample(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewSample(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -44,17 +45,17 @@ func TestSample10Percent(t *testing.T) {
 	totalSampled := 0
 	margin := 0.01
 	for i := 0; i < total; i++ {
-		msgIn := types.NewMessage()
-		msgOut, _, propagate := proc.ProcessMessage(&msgIn)
-		if propagate {
-			if &msgIn != msgOut {
+		msgIn := types.NewMessage(nil)
+		msgs, _ := proc.ProcessMessage(msgIn)
+		if len(msgs) > 0 {
+			if !reflect.DeepEqual(msgIn, msgs[0]) {
 				t.Error("Message told to propagate but not given")
 			}
 			totalSampled++
 		}
 	}
 
-	act, exp := float64(totalSampled)/float64(total), conf.Sample.Retain
+	act, exp := (float64(totalSampled)/float64(total))*100.0, conf.Sample.Retain
 	var sampleError float64
 	if exp > act {
 		sampleError = (exp - act) / exp
@@ -68,10 +69,10 @@ func TestSample10Percent(t *testing.T) {
 
 func TestSample24Percent(t *testing.T) {
 	conf := NewConfig()
-	conf.Sample.Retain = 0.24
+	conf.Sample.Retain = 24.0
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewSample(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewSample(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -81,17 +82,17 @@ func TestSample24Percent(t *testing.T) {
 	totalSampled := 0
 	margin := 0.01
 	for i := 0; i < total; i++ {
-		msgIn := types.NewMessage()
-		msgOut, _, propagate := proc.ProcessMessage(&msgIn)
-		if propagate {
-			if &msgIn != msgOut {
+		msgIn := types.NewMessage(nil)
+		msgs, _ := proc.ProcessMessage(msgIn)
+		if len(msgs) == 1 {
+			if !reflect.DeepEqual(msgIn, msgs[0]) {
 				t.Error("Message told to propagate but not given")
 			}
 			totalSampled++
 		}
 	}
 
-	act, exp := float64(totalSampled)/float64(total), conf.Sample.Retain
+	act, exp := (float64(totalSampled)/float64(total))*100.0, conf.Sample.Retain
 	var sampleError float64
 	if exp > act {
 		sampleError = (exp - act) / exp

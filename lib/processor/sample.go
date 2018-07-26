@@ -23,19 +23,20 @@ package processor
 import (
 	"math/rand"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["sample"] = typeSpec{
+	Constructors["sample"] = TypeSpec{
 		constructor: NewSample,
 		description: `
-Passes on a percentage of messages, either randomly or sequentially, and drops
-all others.`,
+Passes on a randomly sampled percentage of messages. The random seed is static
+in order to sample deterministically, but can be set in config to allow parallel
+samples that are unique.`,
 	}
 }
 
@@ -43,14 +44,14 @@ all others.`,
 
 // SampleConfig contains any configuration for the Sample processor.
 type SampleConfig struct {
-	Retain     float64 `json:"retain"`
-	RandomSeed int64   `json:"seed"`
+	Retain     float64 `json:"retain" yaml:"retain"`
+	RandomSeed int64   `json:"seed" yaml:"seed"`
 }
 
 // NewSampleConfig returns a SampleConfig with default values.
 func NewSampleConfig() SampleConfig {
 	return SampleConfig{
-		Retain:     0.1, // 10%
+		Retain:     10.0, // 10%
 		RandomSeed: 0,
 	}
 }
@@ -64,30 +65,47 @@ type Sample struct {
 	log   log.Modular
 	stats metrics.Type
 
-	gen *rand.Rand
+	retain float64
+	gen    *rand.Rand
+
+	mCount     metrics.StatCounter
+	mDropped   metrics.StatCounter
+	mSent      metrics.StatCounter
+	mSentParts metrics.StatCounter
 }
 
 // NewSample returns a Sample processor.
-func NewSample(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewSample(
+	conf Config, mgr types.Manager, log log.Modular, stats metrics.Type,
+) (Type, error) {
 	gen := rand.New(rand.NewSource(conf.Sample.RandomSeed))
 	return &Sample{
-		conf:  conf,
-		log:   log.NewModule(".processor.sample"),
-		stats: stats,
-		gen:   gen,
+		conf:   conf,
+		log:    log.NewModule(".processor.sample"),
+		stats:  stats,
+		retain: conf.Sample.Retain / 100.0,
+		gen:    gen,
+
+		mCount:     stats.GetCounter("processor.sample.count"),
+		mDropped:   stats.GetCounter("processor.sample.dropped"),
+		mSent:      stats.GetCounter("processor.sample.sent"),
+		mSentParts: stats.GetCounter("processor.sample.parts.sent"),
 	}, nil
 }
 
 //------------------------------------------------------------------------------
 
 // ProcessMessage checks each message against a set of bounds.
-func (s *Sample) ProcessMessage(msg *types.Message) (*types.Message, types.Response, bool) {
-	s.stats.Incr("processor.sample.count", 1)
-	if s.gen.Float64() > s.conf.Sample.Retain {
-		s.stats.Incr("processor.sample.dropped", 1)
-		return nil, types.NewSimpleResponse(nil), false
+func (s *Sample) ProcessMessage(msg types.Message) ([]types.Message, types.Response) {
+	s.mCount.Incr(1)
+	if s.gen.Float64() > s.retain {
+		s.mDropped.Incr(1)
+		return nil, types.NewSimpleResponse(nil)
 	}
-	return msg, nil, true
+	s.mSent.Incr(1)
+	s.mSentParts.Incr(int64(msg.Len()))
+	msgs := [1]types.Message{msg}
+	return msgs[:], nil
 }
 
 //------------------------------------------------------------------------------

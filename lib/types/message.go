@@ -20,19 +20,69 @@
 
 package types
 
+import (
+	"encoding/json"
+	"time"
+)
+
 //------------------------------------------------------------------------------
 
-// Message is a struct containing any relevant fields of a benthos message and
-// helper functions.
-type Message struct {
-	Parts [][]byte `json:"parts"`
+// NewMessage initializes a new message.
+func NewMessage(parts [][]byte) Message {
+	return &messageImpl{
+		createdAt: time.Now(),
+		parts:     parts,
+	}
 }
 
-// NewMessage initializes an empty message.
-func NewMessage() Message {
-	return Message{
-		Parts: [][]byte{},
+// FromBytes deserialises a Message from a byte array.
+func FromBytes(b []byte) (Message, error) {
+	if len(b) < 4 {
+		return nil, ErrBadMessageBytes
 	}
+
+	numParts := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	if numParts >= uint32(len(b)) {
+		return nil, ErrBadMessageBytes
+	}
+
+	b = b[4:]
+
+	m := NewMessage(nil)
+	for i := uint32(0); i < numParts; i++ {
+		if len(b) < 4 {
+			return nil, ErrBadMessageBytes
+		}
+		partSize := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+		b = b[4:]
+
+		if uint32(len(b)) < partSize {
+			return nil, ErrBadMessageBytes
+		}
+		m.Append(b[:partSize])
+		b = b[partSize:]
+	}
+	return m, nil
+}
+
+//------------------------------------------------------------------------------
+
+// partCache is a cache of operations performed on message parts, a part cache
+// becomes invalid when the contents of a part is changed.
+type partCache struct {
+	json interface{}
+}
+
+//------------------------------------------------------------------------------
+
+// messageImpl is a struct containing any relevant fields of a benthos message
+// and
+// helper functions.
+type messageImpl struct {
+	createdAt   time.Time
+	parts       [][]byte
+	partCaches  []*partCache
+	resultCache map[string]bool
 }
 
 //------------------------------------------------------------------------------
@@ -45,30 +95,30 @@ Internal message blob format:
     + Four bytes containing length of message part in big endian
     + Content of message part
 
-                                         # Of bytes in message 2
+                                         # Of bytes in message part 2
                                          |
-# Of message parts (big endian)          |           Content of message 2
+# Of message parts (u32 big endian)      |           Content of message part 2
 |                                        |           |
 v                                        v           v
 | 0| 0| 0| 2| 0| 0| 0| 5| h| e| l| l| o| 0| 0| 0| 5| w| o| r| l| d|
   0  1  2  3  4  5  6  7  8  9 10 11 13 14 15 16 17 18 19 20 21 22
               ^           ^
               |           |
-              |           Content of message 1
+              |           Content of message part 1
               |
-              # Of bytes in message 1 (big endian)
+              # Of bytes in message part 1 (u32 big endian)
 */
 
 // Reserve bytes for our length counter (4 * 8 = 32 bit)
 var intLen uint32 = 4
 
 // Bytes serialises the message into a single byte array.
-func (m *Message) Bytes() []byte {
-	lenParts := uint32(len(m.Parts))
+func (m *messageImpl) Bytes() []byte {
+	lenParts := uint32(len(m.parts))
 
 	l := (lenParts + 1) * intLen
-	for i := range m.Parts {
-		l += uint32(len(m.Parts[i]))
+	for i := range m.parts {
+		l += uint32(len(m.parts[i]))
 	}
 	b := make([]byte, l)
 
@@ -78,8 +128,8 @@ func (m *Message) Bytes() []byte {
 	b[3] = byte(lenParts)
 
 	b2 := b[intLen:]
-	for i := range m.Parts {
-		le := uint32(len(m.Parts[i]))
+	for i := range m.parts {
+		le := uint32(len(m.parts[i]))
 
 		b2[0] = byte(le >> 24)
 		b2[1] = byte(le >> 16)
@@ -88,43 +138,174 @@ func (m *Message) Bytes() []byte {
 
 		b2 = b2[intLen:]
 
-		copy(b2, m.Parts[i])
-		b2 = b2[len(m.Parts[i]):]
+		copy(b2, m.parts[i])
+		b2 = b2[len(m.parts[i]):]
 	}
 	return b
 }
 
-// FromBytes deserialises a Message from a byte array.
-func FromBytes(b []byte) (Message, error) {
-	var m Message
+//------------------------------------------------------------------------------
 
-	if len(b) < 4 {
-		return m, ErrBadMessageBytes
+// ShallowCopy creates a new shallow copy of the message. Parts can be
+// re-arranged in the new copy and JSON parts can be get/set without impacting
+// other message copies. However, it is still unsafe to edit the content of
+// parts.
+func (m *messageImpl) ShallowCopy() Message {
+	// NOTE: JSON parts are not copied here, as even though we can safely copy
+	// the hash and len fields we cannot safely copy the content as it may
+	// contain pointers or ref types.
+	return &messageImpl{
+		createdAt:   m.createdAt,
+		parts:       append([][]byte(nil), m.parts...),
+		resultCache: m.resultCache,
 	}
+}
 
-	numParts := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-	if numParts >= uint32(len(b)) {
-		return m, ErrBadMessageBytes
+// DeepCopy creates a new deep copy of the message. This can be considered an
+// entirely new object that is safe to use anywhere.
+func (m *messageImpl) DeepCopy() Message {
+	newParts := make([][]byte, len(m.parts))
+	for i, p := range m.parts {
+		np := make([]byte, len(p))
+		copy(np, p)
+		newParts[i] = np
 	}
+	return &messageImpl{
+		createdAt: m.createdAt,
+		parts:     newParts,
+	}
+}
 
-	m.Parts = make([][]byte, numParts)
+//------------------------------------------------------------------------------
 
-	b = b[4:]
+func (m *messageImpl) Get(index int) []byte {
+	if index < 0 {
+		index = len(m.parts) + index
+	}
+	if index < 0 || index >= len(m.parts) {
+		return nil
+	}
+	return m.parts[index]
+}
 
-	for i := uint32(0); i < numParts; i++ {
-		if len(b) < 4 {
-			return m, ErrBadMessageBytes
+func (m *messageImpl) GetAll() [][]byte {
+	return m.parts
+}
+
+func (m *messageImpl) Set(index int, b []byte) {
+	if index < 0 {
+		index = len(m.parts) + index
+	}
+	if index < 0 || index >= len(m.parts) {
+		return
+	}
+	if len(m.partCaches) > index {
+		// Remove now invalid part cache.
+		m.partCaches[index] = nil
+	}
+	m.clearGeneralCaches()
+	m.parts[index] = b
+}
+
+func (m *messageImpl) SetAll(p [][]byte) {
+	m.parts = p
+	m.clearAllCaches()
+}
+
+func (m *messageImpl) Append(b ...[]byte) int {
+	for _, p := range b {
+		m.parts = append(m.parts, p)
+	}
+	m.clearGeneralCaches()
+	return len(m.parts) - 1
+}
+
+func (m *messageImpl) Len() int {
+	return len(m.parts)
+}
+
+func (m *messageImpl) Iter(f func(i int, b []byte) error) error {
+	for i, p := range m.parts {
+		if err := f(i, p); err != nil {
+			return err
 		}
-		partSize := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-		b = b[4:]
-
-		if uint32(len(b)) < partSize {
-			return m, ErrBadMessageBytes
-		}
-		m.Parts[i] = b[:partSize]
-		b = b[partSize:]
 	}
-	return m, nil
+	return nil
+}
+
+func (m *messageImpl) expandCache(index int) {
+	if len(m.partCaches) > index {
+		return
+	}
+	cParts := make([]*partCache, index+1)
+	copy(cParts, m.partCaches)
+	m.partCaches = cParts
+}
+
+func (m *messageImpl) clearGeneralCaches() {
+	m.resultCache = nil
+}
+
+func (m *messageImpl) clearAllCaches() {
+	m.resultCache = nil
+	m.partCaches = nil
+}
+
+func (m *messageImpl) GetJSON(part int) (interface{}, error) {
+	if part < 0 {
+		part = len(m.parts) + part
+	}
+	if part < 0 || part >= len(m.parts) {
+		return nil, ErrMessagePartNotExist
+	}
+	m.expandCache(part)
+	cPart := m.partCaches[part]
+	if cPart == nil {
+		cPart = &partCache{}
+		m.partCaches[part] = cPart
+	}
+	if err := json.Unmarshal(m.Get(part), &cPart.json); err != nil {
+		return nil, err
+	}
+	return cPart.json, nil
+}
+
+func (m *messageImpl) SetJSON(part int, jObj interface{}) error {
+	if part < 0 {
+		part = len(m.parts) + part
+	}
+	if part < 0 || part >= len(m.parts) {
+		return ErrMessagePartNotExist
+	}
+	m.expandCache(part)
+
+	partBytes, err := json.Marshal(jObj)
+	if err != nil {
+		return err
+	}
+
+	m.Set(part, partBytes)
+	m.partCaches[part] = &partCache{
+		json: jObj,
+	}
+	m.clearGeneralCaches()
+	return nil
+}
+
+func (m *messageImpl) LazyCondition(label string, cond Condition) bool {
+	if m.resultCache == nil {
+		m.resultCache = map[string]bool{}
+	} else if res, exists := m.resultCache[label]; exists {
+		return res
+	}
+
+	res := cond.Check(m)
+	m.resultCache[label] = res
+	return res
+}
+
+func (m *messageImpl) CreatedAt() time.Time {
+	return m.createdAt
 }
 
 //------------------------------------------------------------------------------

@@ -23,18 +23,9 @@ package broker
 import (
 	"time"
 
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
-
-//------------------------------------------------------------------------------
-
-// wrappedMsg used to forward an inputs message and res channel to the FanIn
-// broker.
-type wrappedMsg struct {
-	msg     types.Message
-	resChan chan<- types.Response
-}
 
 //------------------------------------------------------------------------------
 
@@ -43,11 +34,9 @@ type wrappedMsg struct {
 type FanIn struct {
 	stats metrics.Type
 
-	messageChan  chan types.Message
-	responseChan <-chan types.Response
+	transactions chan types.Transaction
 
 	closables       []types.Closable
-	wrappedMsgsChan chan wrappedMsg
 	inputClosedChan chan int
 	inputMap        map[int]struct{}
 
@@ -59,10 +48,8 @@ func NewFanIn(inputs []types.Producer, stats metrics.Type) (*FanIn, error) {
 	i := &FanIn{
 		stats: stats,
 
-		messageChan:  make(chan types.Message),
-		responseChan: nil,
+		transactions: make(chan types.Transaction),
 
-		wrappedMsgsChan: make(chan wrappedMsg),
 		inputClosedChan: make(chan int),
 		inputMap:        make(map[int]struct{}),
 
@@ -78,12 +65,6 @@ func NewFanIn(inputs []types.Producer, stats metrics.Type) (*FanIn, error) {
 		// Keep track of # open inputs
 		i.inputMap[n] = struct{}{}
 
-		// Create unique response channel for each input
-		resChan := make(chan types.Response)
-		if err := inputs[n].StartListening(resChan); err != nil {
-			return nil, err
-		}
-
 		// Launch goroutine that async writes input into single channel
 		go func(index int) {
 			defer func() {
@@ -91,36 +72,25 @@ func NewFanIn(inputs []types.Producer, stats metrics.Type) (*FanIn, error) {
 				i.inputClosedChan <- index
 			}()
 			for {
-				in, open := <-inputs[index].MessageChan()
+				in, open := <-inputs[index].TransactionChan()
 				if !open {
 					return
 				}
-				i.wrappedMsgsChan <- wrappedMsg{
-					msg:     in,
-					resChan: resChan,
-				}
+				i.transactions <- in
 			}
 		}(n)
 	}
+
+	go i.loop()
 	return i, nil
 }
 
 //------------------------------------------------------------------------------
 
-// StartListening assigns a new responses channel for the broker to read.
-func (i *FanIn) StartListening(responseChan <-chan types.Response) error {
-	if i.responseChan != nil {
-		return types.ErrAlreadyStarted
-	}
-	i.responseChan = responseChan
-
-	go i.loop()
-	return nil
-}
-
-// MessageChan returns the channel used for consuming messages from this broker.
-func (i *FanIn) MessageChan() <-chan types.Message {
-	return i.messageChan
+// TransactionChan returns the channel used for consuming transactions from this
+// broker.
+func (i *FanIn) TransactionChan() <-chan types.Transaction {
+	return i.transactions
 }
 
 //------------------------------------------------------------------------------
@@ -128,22 +98,14 @@ func (i *FanIn) MessageChan() <-chan types.Message {
 // loop is an internal loop that brokers incoming messages to many outputs.
 func (i *FanIn) loop() {
 	defer func() {
-		close(i.wrappedMsgsChan)
 		close(i.inputClosedChan)
-		close(i.messageChan)
+		close(i.transactions)
 		close(i.closedChan)
 	}()
 
 	for len(i.inputMap) > 0 {
-		select {
-		case wrap := <-i.wrappedMsgsChan:
-			i.stats.Incr("broker.fan_in.messages.received", 1)
-			i.messageChan <- wrap.msg
-			// TODO: If our output closes it won't be propagated.
-			wrap.resChan <- <-i.responseChan
-		case index := <-i.inputClosedChan:
-			delete(i.inputMap, index)
-		}
+		index := <-i.inputClosedChan
+		delete(i.inputMap, index)
 	}
 }
 

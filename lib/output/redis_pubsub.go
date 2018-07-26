@@ -25,16 +25,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 	"github.com/go-redis/redis"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["redis_pubsub"] = typeSpec{
+	Constructors["redis_pubsub"] = TypeSpec{
 		constructor: NewRedisPubSub,
 		description: `
 Publishes messages through the Redis PubSub model. It is not possible to
@@ -72,24 +72,21 @@ type RedisPubSub struct {
 
 	client *redis.Client
 
-	messages     <-chan types.Message
-	responseChan chan types.Response
+	transactions <-chan types.Transaction
 
 	closedChan chan struct{}
 	closeChan  chan struct{}
 }
 
 // NewRedisPubSub creates a new RedisPubSub output type.
-func NewRedisPubSub(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewRedisPubSub(conf Config, mgr types.Manager, log log.Modular, stats metrics.Type) (Type, error) {
 	r := &RedisPubSub{
-		running:      1,
-		log:          log.NewModule(".output.redis_pubsub"),
-		stats:        stats,
-		conf:         conf,
-		messages:     nil,
-		responseChan: make(chan types.Response),
-		closedChan:   make(chan struct{}),
-		closeChan:    make(chan struct{}),
+		running:    1,
+		log:        log.NewModule(".output.redis_pubsub"),
+		stats:      stats,
+		conf:       conf,
+		closedChan: make(chan struct{}),
+		closeChan:  make(chan struct{}),
 	}
 
 	var err error
@@ -137,16 +134,26 @@ func (r *RedisPubSub) disconnect() error {
 
 // loop is an internal loop that brokers incoming messages to output pipe.
 func (r *RedisPubSub) loop() {
+	var (
+		mRunning   = r.stats.GetCounter("output.redis_pubsub.running")
+		mReconErr  = r.stats.GetCounter("output.redis_pubsub.reconnect.error")
+		mReconSucc = r.stats.GetCounter("output.redis_pubsub.reconnect.success")
+		mCount     = r.stats.GetCounter("output.redis_pubsub.count")
+		mSucc      = r.stats.GetCounter("output.redis_pubsub.send.success")
+		mErr       = r.stats.GetCounter("output.redis_pubsub.send.error")
+	)
+
 	defer func() {
 		atomic.StoreInt32(&r.running, 0)
 
 		if err := r.disconnect(); err != nil {
 			r.log.Errorf("Failed to disconnect redis client: %v\n", err)
 		}
+		mRunning.Decr(1)
 
-		close(r.responseChan)
 		close(r.closedChan)
 	}()
+	mRunning.Incr(1)
 
 	for {
 		if err := r.connect(); err != nil {
@@ -167,7 +174,7 @@ func (r *RedisPubSub) loop() {
 		for r.client == nil {
 			r.log.Warnln("Lost RedisPubSub connection, attempting to reconnect.")
 			if err := r.connect(); err != nil {
-				r.stats.Incr("output.redis_pubsub.reconnect.error", 1)
+				mReconErr.Incr(1)
 				select {
 				case <-time.After(time.Second):
 				case <-r.closeChan:
@@ -175,13 +182,13 @@ func (r *RedisPubSub) loop() {
 				}
 			} else {
 				r.log.Warnln("Successfully reconnected to RedisPubSub.")
-				r.stats.Incr("output.redis_pubsub.reconnect.success", 1)
+				mReconSucc.Incr(1)
 			}
 		}
 
-		var msg types.Message
+		var ts types.Transaction
 		select {
-		case msg, open = <-r.messages:
+		case ts, open = <-r.transactions:
 			if !open {
 				return
 			}
@@ -189,39 +196,34 @@ func (r *RedisPubSub) loop() {
 			return
 		}
 
-		r.stats.Incr("output.redis_pubsub.count", 1)
+		mCount.Incr(1)
 		var err error
-		for _, part := range msg.Parts {
+		for _, part := range ts.Payload.GetAll() {
 			if _, err = r.client.Publish(r.conf.RedisPubSub.Channel, part).Result(); err == nil {
-				r.stats.Incr("output.redis_pubsub.send.success", 1)
+				mSucc.Incr(1)
 			} else {
 				r.disconnect()
-				r.stats.Incr("output.redis_pubsub.send.error", 1)
+				mErr.Incr(1)
 				break
 			}
 		}
 
 		select {
-		case r.responseChan <- types.NewSimpleResponse(err):
+		case ts.ResponseChan <- types.NewSimpleResponse(err):
 		case <-r.closeChan:
 			return
 		}
 	}
 }
 
-// StartReceiving assigns a messages channel for the output to read.
-func (r *RedisPubSub) StartReceiving(msgs <-chan types.Message) error {
-	if r.messages != nil {
+// Consume assigns a messages channel for the output to read.
+func (r *RedisPubSub) Consume(ts <-chan types.Transaction) error {
+	if r.transactions != nil {
 		return types.ErrAlreadyStarted
 	}
-	r.messages = msgs
+	r.transactions = ts
 	go r.loop()
 	return nil
-}
-
-// ResponseChan returns the errors channel.
-func (r *RedisPubSub) ResponseChan() <-chan types.Response {
-	return r.responseChan
 }
 
 // CloseAsync shuts down the RedisPubSub output and stops processing messages.

@@ -21,15 +21,15 @@
 package processor
 
 import (
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["select_parts"] = typeSpec{
+	Constructors["select_parts"] = TypeSpec{
 		constructor: NewSelectParts,
 		description: `
 Cherry pick a set of parts from messages by their index. Indexes larger than the
@@ -40,7 +40,12 @@ selection array. E.g. with 'parts' set to [ 2, 0, 1 ] and the message parts
 [ '0', '1', '2', '3' ], the output will be [ '2', '0', '1' ].
 
 If none of the selected parts exist in the input message (resulting in an empty
-output message) the message is dropped entirely.`,
+output message) the message is dropped entirely.
+
+Part indexes can be negative, and if so the part will be selected from the end
+counting backwards starting from -1. E.g. if index = -1 then the selected part
+will be the last part of the message, if index = -2 then the part before the
+last element with be selected, and so on.`,
 	}
 }
 
@@ -66,39 +71,65 @@ type SelectParts struct {
 	conf  Config
 	log   log.Modular
 	stats metrics.Type
+
+	mCount     metrics.StatCounter
+	mSkipped   metrics.StatCounter
+	mSelected  metrics.StatCounter
+	mDropped   metrics.StatCounter
+	mSent      metrics.StatCounter
+	mSentParts metrics.StatCounter
 }
 
 // NewSelectParts returns a SelectParts processor.
-func NewSelectParts(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewSelectParts(
+	conf Config, mgr types.Manager, log log.Modular, stats metrics.Type,
+) (Type, error) {
 	return &SelectParts{
 		conf:  conf,
 		log:   log.NewModule(".processor.select_parts"),
 		stats: stats,
+
+		mCount:     stats.GetCounter("processor.select_parts.count"),
+		mSkipped:   stats.GetCounter("processor.select_parts.skipped"),
+		mSelected:  stats.GetCounter("processor.select_parts.selected"),
+		mDropped:   stats.GetCounter("processor.select_parts.dropped"),
+		mSent:      stats.GetCounter("processor.select_parts.sent"),
+		mSentParts: stats.GetCounter("processor.select_parts.parts.sent"),
 	}, nil
 }
 
 //------------------------------------------------------------------------------
 
 // ProcessMessage extracts a set of parts from each message.
-func (m *SelectParts) ProcessMessage(msg *types.Message) (*types.Message, types.Response, bool) {
-	m.stats.Incr("processor.select_parts.count", 1)
+func (m *SelectParts) ProcessMessage(msg types.Message) ([]types.Message, types.Response) {
+	m.mCount.Incr(1)
 
-	newMsg := types.NewMessage()
-	lParts := len(msg.Parts)
+	newMsg := types.NewMessage(nil)
+	lParts := msg.Len()
 	for _, index := range m.conf.SelectParts.Parts {
-		if index < lParts {
-			m.stats.Incr("processor.select_parts.selected", 1)
-			newMsg.Parts = append(newMsg.Parts, msg.Parts[index])
+		if index < 0 {
+			// Negative indexes count backwards from the end.
+			index = lParts + index
+		}
+
+		// Check boundary of part index.
+		if index < 0 || index >= lParts {
+			m.mSkipped.Incr(1)
 		} else {
-			m.stats.Incr("processor.select_parts.skipped", 1)
+			m.mSelected.Incr(1)
+			newMsg.Append(msg.Get(index))
 		}
 	}
 
-	if len(newMsg.Parts) == 0 {
-		return nil, nil, false
+	if newMsg.Len() == 0 {
+		m.mDropped.Incr(1)
+		return nil, types.NewSimpleResponse(nil)
 	}
 
-	return &newMsg, nil, true
+	m.mSent.Incr(1)
+	m.mSentParts.Incr(int64(newMsg.Len()))
+	msgs := [1]types.Message{newMsg}
+	return msgs[:], nil
 }
 
 //------------------------------------------------------------------------------

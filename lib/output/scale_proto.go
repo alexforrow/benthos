@@ -21,61 +21,33 @@
 package output
 
 import (
-	"errors"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-mangos/mangos"
-	"github.com/go-mangos/mangos/protocol/pub"
-	"github.com/go-mangos/mangos/protocol/push"
-	"github.com/go-mangos/mangos/protocol/req"
-	"github.com/go-mangos/mangos/transport/ipc"
-	"github.com/go-mangos/mangos/transport/tcp"
+	"nanomsg.org/go-mangos"
+	"nanomsg.org/go-mangos/protocol/pub"
+	"nanomsg.org/go-mangos/protocol/push"
+	"nanomsg.org/go-mangos/transport/ipc"
+	"nanomsg.org/go-mangos/transport/tcp"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["scalability_protocols"] = typeSpec{
+	Constructors["scalability_protocols"] = TypeSpec{
 		constructor: NewScaleProto,
 		description: `
-The scalability protocols are common communication patterns which will be
-familiar to anyone accustomed to service messaging protocols.
+The scalability protocols are common communication patterns. This output should
+be compatible with any implementation, but specifically targets Nanomsg.
 
-This outnput type should be compatible with any implementation of these
-protocols, but nanomsg (http://nanomsg.org/index.html) is the specific target of
-this type.
-
-Since scale proto messages are only single part we would need a binary format
-for sending multi part messages. We can use the benthos binary format for this
-purpose. However, this format may appear to be gibberish to other services. If
-you want to use the binary format you can set 'benthos_multi' to true.
-
-Currently only PUSH, PUB and REQ sockets are supported.
-
-When using REQ sockets Benthos will expect acknowledgement from the consumer
-that the message has been successfully propagated downstream. This comes in the
-form of an expected response which is set by the 'reply_success' configuration
-field.
-
-If the reply from a REQ message is either not returned within the
-'reply_timeout_ms' period, or if the reply does not match our 'reply_success'
-string, then the message is considered lost and will be sent again.`,
+Currently only PUSH and PUB sockets are supported.`,
 	}
 }
-
-//------------------------------------------------------------------------------
-
-var (
-	// ErrBadReply is returned when a client gives a reply that is not the
-	// expected success string.
-	ErrBadReply = errors.New("bad reply from client")
-)
 
 //------------------------------------------------------------------------------
 
@@ -84,9 +56,7 @@ type ScaleProtoConfig struct {
 	URLs          []string `json:"urls" yaml:"urls"`
 	Bind          bool     `json:"bind" yaml:"bind"`
 	SocketType    string   `json:"socket_type" yaml:"socket_type"`
-	SuccessStr    string   `json:"reply_success" yaml:"reply_success"`
 	PollTimeoutMS int      `json:"poll_timeout_ms" yaml:"poll_timeout_ms"`
-	RepTimeoutMS  int      `json:"reply_timeout_ms" yaml:"reply_timeout_ms"`
 }
 
 // NewScaleProtoConfig creates a new ScaleProtoConfig with default values.
@@ -95,9 +65,7 @@ func NewScaleProtoConfig() ScaleProtoConfig {
 		URLs:          []string{"tcp://localhost:5556"},
 		Bind:          false,
 		SocketType:    "PUSH",
-		SuccessStr:    "SUCCESS",
 		PollTimeoutMS: 5000,
-		RepTimeoutMS:  5000,
 	}
 }
 
@@ -115,24 +83,21 @@ type ScaleProto struct {
 
 	socket mangos.Socket
 
-	messages     <-chan types.Message
-	responseChan chan types.Response
+	transactions <-chan types.Transaction
 
 	closedChan chan struct{}
 	closeChan  chan struct{}
 }
 
 // NewScaleProto creates a new ScaleProto output type.
-func NewScaleProto(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewScaleProto(conf Config, mgr types.Manager, log log.Modular, stats metrics.Type) (Type, error) {
 	s := ScaleProto{
-		running:      1,
-		log:          log.NewModule(".output.scale_proto"),
-		stats:        stats,
-		conf:         conf,
-		messages:     nil,
-		responseChan: make(chan types.Response),
-		closedChan:   make(chan struct{}),
-		closeChan:    make(chan struct{}),
+		running:    1,
+		log:        log.NewModule(".output.scale_proto"),
+		stats:      stats,
+		conf:       conf,
+		closedChan: make(chan struct{}),
+		closeChan:  make(chan struct{}),
 	}
 	for _, u := range conf.ScaleProto.URLs {
 		for _, splitU := range strings.Split(u, ",") {
@@ -152,13 +117,6 @@ func NewScaleProto(conf Config, log log.Modular, stats metrics.Type) (Type, erro
 	err = s.socket.SetOption(
 		mangos.OptionRecvDeadline,
 		time.Millisecond*time.Duration(s.conf.ScaleProto.PollTimeoutMS),
-	)
-	if nil != err {
-		return nil, err
-	}
-	err = s.socket.SetOption(
-		mangos.OptionSendDeadline,
-		time.Millisecond*time.Duration(s.conf.ScaleProto.RepTimeoutMS),
 	)
 	if nil != err {
 		return nil, err
@@ -196,8 +154,6 @@ func getSocketFromType(t string) (mangos.Socket, error) {
 		return push.NewSocket()
 	case "PUB":
 		return pub.NewSocket()
-	case "REQ":
-		return req.NewSocket()
 	}
 	return nil, types.ErrInvalidScaleProtoType
 }
@@ -207,13 +163,22 @@ func getSocketFromType(t string) (mangos.Socket, error) {
 // loop is an internal loop that brokers incoming messages to output pipe, does
 // not use select.
 func (s *ScaleProto) loop() {
+	var (
+		mRunning  = s.stats.GetCounter("output.scale_proto.running")
+		mCount    = s.stats.GetCounter("output.scale_proto.count")
+		mSendErr  = s.stats.GetCounter("output.scale_proto.send.error")
+		mSendSucc = s.stats.GetCounter("output.scale_proto.send.success")
+	)
+
 	defer func() {
 		atomic.StoreInt32(&s.running, 0)
 
 		s.socket.Close()
-		close(s.responseChan)
+		mRunning.Decr(1)
+
 		close(s.closedChan)
 	}()
+	mRunning.Incr(1)
 
 	if s.conf.ScaleProto.Bind {
 		s.log.Infof(
@@ -227,65 +192,45 @@ func (s *ScaleProto) loop() {
 		)
 	}
 
-	isReq := (s.conf.ScaleProto.SocketType == "REQ")
-
 	var open bool
 	for atomic.LoadInt32(&s.running) == 1 {
-		var msg types.Message
+		var ts types.Transaction
 		select {
-		case msg, open = <-s.messages:
+		case ts, open = <-s.transactions:
 			if !open {
 				return
 			}
 		case <-s.closeChan:
 			return
 		}
-		s.stats.Incr("output.scale_proto.count", 1)
+		mCount.Incr(1)
 		var err error
-		for _, part := range msg.Parts {
-			if err = s.socket.Send(part); err == nil {
-				if isReq {
-					var reply []byte
-					if reply, err = s.socket.Recv(); err != nil {
-						s.stats.Incr("output.scale_proto.send.rep.error", 1)
-					} else if string(reply) != s.conf.ScaleProto.SuccessStr {
-						s.stats.Incr("output.scale_proto.send.rep.error", 1)
-						err = ErrBadReply
-					} else {
-						s.stats.Incr("output.scale_proto.send.rep.success", 1)
-					}
-				}
-			}
-			if err != nil {
+		for _, part := range ts.Payload.GetAll() {
+			if err = s.socket.Send(part); err != nil {
 				break
 			}
 		}
 		if err != nil {
-			s.stats.Incr("output.scale_proto.send.error", 1)
+			mSendErr.Incr(1)
 		} else {
-			s.stats.Incr("output.scale_proto.send.success", 1)
+			mSendSucc.Incr(1)
 		}
 		select {
-		case s.responseChan <- types.NewSimpleResponse(err):
+		case ts.ResponseChan <- types.NewSimpleResponse(err):
 		case <-s.closeChan:
 			return
 		}
 	}
 }
 
-// StartReceiving assigns a messages channel for the output to read.
-func (s *ScaleProto) StartReceiving(msgs <-chan types.Message) error {
-	if s.messages != nil {
+// Consume assigns a messages channel for the output to read.
+func (s *ScaleProto) Consume(ts <-chan types.Transaction) error {
+	if s.transactions != nil {
 		return types.ErrAlreadyStarted
 	}
-	s.messages = msgs
+	s.transactions = ts
 	go s.loop()
 	return nil
-}
-
-// ResponseChan returns the errors channel.
-func (s *ScaleProto) ResponseChan() <-chan types.Response {
-	return s.responseChan
 }
 
 // CloseAsync shuts down the ScaleProto output and stops processing messages.

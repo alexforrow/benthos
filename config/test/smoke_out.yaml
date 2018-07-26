@@ -1,6 +1,8 @@
+http:
+  address: 0.0.0.0:4196
 input:
-  type: fan_in
-  fan_in:
+  type: broker
+  broker:
     inputs:
     - type: redis_pubsub
       redis_pubsub:
@@ -48,9 +50,15 @@ input:
         cluster_id: test-cluster
         client_id: benthos_client_2
         subject: benthos_messages
+    - type: mqtt
+      mqtt:
+        urls:
+        - tcp://mqtt:1883
+        qos: 1
+        topics:
+        - benthos_topic
+        client_id: benthos_input
 output:
-  type: file
-  file:
-    path: /output/smoke-output.txt
+  type: http_server
 logger:
   log_level: INFO

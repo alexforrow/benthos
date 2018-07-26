@@ -21,15 +21,15 @@
 package buffer
 
 import (
-	"github.com/Jeffail/benthos/lib/buffer/impl"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/buffer/single"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["mmap_file"] = typeSpec{
+	Constructors["mmap_file"] = TypeSpec{
 		constructor: NewMmapFile,
 		description: `
 The mmap file buffer type uses memory mapped files to perform low-latency,
@@ -50,11 +50,11 @@ fill up as fast as data passes through.`,
 // NewMmapFile creates a buffer held in memory and persisted to file through
 // memory map.
 func NewMmapFile(config Config, log log.Modular, stats metrics.Type) (Type, error) {
-	b, err := impl.NewMmapBuffer(config.Mmap, log.NewModule(".buffer.mmap_file"), stats)
+	b, err := single.NewMmapBuffer(config.Mmap, log.NewModule(".buffer.mmap_file"), stats)
 	if err != nil {
 		return nil, err
 	}
-	return NewOutputWrapper(b, stats), nil
+	return NewSingleWrapper(config, b, log, stats), nil
 }
 
 //------------------------------------------------------------------------------

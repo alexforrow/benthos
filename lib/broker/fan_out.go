@@ -24,21 +24,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/util/throttle"
 )
-
-//------------------------------------------------------------------------------
-
-// FanOutConfig is config values for the fan out type.
-type FanOutConfig struct {
-}
-
-// NewFanOutConfig creates a FanOutConfig fully populated with default values.
-func NewFanOutConfig() FanOutConfig {
-	return FanOutConfig{}
-}
 
 //------------------------------------------------------------------------------
 
@@ -50,13 +40,13 @@ type FanOut struct {
 	logger log.Modular
 	stats  metrics.Type
 
-	conf FanOutConfig
+	throt *throttle.Type
 
-	messages     <-chan types.Message
-	responseChan chan types.Response
+	transactions <-chan types.Transaction
 
-	outputMsgChans []chan types.Message
-	outputs        []types.Consumer
+	outputTsChans  []chan types.Transaction
+	outputResChans []chan types.Response
+	outputs        []types.Output
 	outputNs       []int
 
 	closedChan chan struct{}
@@ -65,25 +55,27 @@ type FanOut struct {
 
 // NewFanOut creates a new FanOut type by providing outputs.
 func NewFanOut(
-	conf FanOutConfig, outputs []types.Consumer, logger log.Modular, stats metrics.Type,
+	outputs []types.Output, logger log.Modular, stats metrics.Type,
 ) (*FanOut, error) {
 	o := &FanOut{
 		running:      1,
 		stats:        stats,
 		logger:       logger.NewModule(".broker.fan_out"),
-		conf:         conf,
-		messages:     nil,
-		responseChan: make(chan types.Response),
+		transactions: nil,
 		outputs:      outputs,
 		outputNs:     []int{},
 		closedChan:   make(chan struct{}),
 		closeChan:    make(chan struct{}),
 	}
-	o.outputMsgChans = make([]chan types.Message, len(o.outputs))
-	for i := range o.outputMsgChans {
+	o.throt = throttle.New(throttle.OptCloseChan(o.closeChan))
+
+	o.outputTsChans = make([]chan types.Transaction, len(o.outputs))
+	o.outputResChans = make([]chan types.Response, len(o.outputs))
+	for i := range o.outputTsChans {
 		o.outputNs = append(o.outputNs, i)
-		o.outputMsgChans[i] = make(chan types.Message)
-		if err := o.outputs[i].StartReceiving(o.outputMsgChans[i]); err != nil {
+		o.outputTsChans[i] = make(chan types.Transaction)
+		o.outputResChans[i] = make(chan types.Response)
+		if err := o.outputs[i].Consume(o.outputTsChans[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -92,12 +84,12 @@ func NewFanOut(
 
 //------------------------------------------------------------------------------
 
-// StartReceiving assigns a new messages channel for the broker to read.
-func (o *FanOut) StartReceiving(msgs <-chan types.Message) error {
-	if o.messages != nil {
+// Consume assigns a new transactions channel for the broker to read.
+func (o *FanOut) Consume(transactions <-chan types.Transaction) error {
+	if o.transactions != nil {
 		return types.ErrAlreadyStarted
 	}
-	o.messages = msgs
+	o.transactions = transactions
 
 	go o.loop()
 	return nil
@@ -108,53 +100,58 @@ func (o *FanOut) StartReceiving(msgs <-chan types.Message) error {
 // loop is an internal loop that brokers incoming messages to many outputs.
 func (o *FanOut) loop() {
 	defer func() {
-		for _, c := range o.outputMsgChans {
+		for _, c := range o.outputTsChans {
 			close(c)
 		}
-		close(o.responseChan)
 		close(o.closedChan)
 	}()
 
+	var (
+		mMsgsRcvd  = o.stats.GetCounter("broker.fan_out.messages.received")
+		mOutputErr = o.stats.GetCounter("broker.fan_out.output.error")
+		mMsgsSnt   = o.stats.GetCounter("broker.fan_out.messages.sent")
+	)
+
 	for atomic.LoadInt32(&o.running) == 1 {
-		var msg types.Message
+		var ts types.Transaction
 		var open bool
 
 		select {
-		case msg, open = <-o.messages:
+		case ts, open = <-o.transactions:
 			if !open {
 				return
 			}
 		case <-o.closeChan:
 			return
 		}
-		o.stats.Incr("broker.fan_out.messages.received", 1)
+		mMsgsRcvd.Incr(1)
 
 		outputTargets := o.outputNs
 		for len(outputTargets) > 0 {
 			for _, i := range outputTargets {
+				// Perform a copy here as it could be dangerous to release the
+				// same message to parallel processor pipelines.
+				msgCopy := ts.Payload.ShallowCopy()
 				select {
-				case o.outputMsgChans[i] <- msg:
+				case o.outputTsChans[i] <- types.NewTransaction(msgCopy, o.outputResChans[i]):
 				case <-o.closeChan:
 					return
 				}
 			}
 			newTargets := []int{}
 			for _, i := range outputTargets {
-				var res types.Response
 				select {
-				case res, open = <-o.outputs[i].ResponseChan():
-					if !open {
-						// If any of our outputs is closed then we exit
-						// completely. We want to avoid silently starving a
-						// particular output.
-						o.logger.Warnln("Closing fan_out broker due to closed output")
-						return
-					} else if res.Error() != nil {
+				case res := <-o.outputResChans[i]:
+					if res.Error() != nil {
 						newTargets = append(newTargets, i)
 						o.logger.Errorf("Failed to dispatch fan out message: %v\n", res.Error())
-						o.stats.Incr("broker.fan_out.output.error", 1)
+						mOutputErr.Incr(1)
+						if !o.throt.Retry() {
+							return
+						}
 					} else {
-						o.stats.Incr("broker.fan_out.messages.sent", 1)
+						o.throt.Reset()
+						mMsgsSnt.Incr(1)
 					}
 				case <-o.closeChan:
 					return
@@ -163,16 +160,11 @@ func (o *FanOut) loop() {
 			outputTargets = newTargets
 		}
 		select {
-		case o.responseChan <- types.NewSimpleResponse(nil):
+		case ts.ResponseChan <- types.NewSimpleResponse(nil):
 		case <-o.closeChan:
 			return
 		}
 	}
-}
-
-// ResponseChan returns the response channel.
-func (o *FanOut) ResponseChan() <-chan types.Response {
-	return o.responseChan
 }
 
 // CloseAsync shuts down the FanOut broker and stops processing requests.

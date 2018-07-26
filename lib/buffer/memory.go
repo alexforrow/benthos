@@ -21,20 +21,20 @@
 package buffer
 
 import (
-	"github.com/Jeffail/benthos/lib/buffer/impl"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/buffer/parallel"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["memory"] = typeSpec{
+	Constructors["memory"] = TypeSpec{
 		constructor: NewMemory,
 		description: `
 The memory buffer type simply allocates a set amount of RAM for buffering
-messages. This protects the pipeline against backpressure until this buffer is
-full. The messages are lost if the service is stopped.`,
+messages. This can be useful when reading from sources that produce large bursts
+of data. Messages inside the buffer are lost if the service is stopped.`,
 	}
 }
 
@@ -42,7 +42,7 @@ full. The messages are lost if the service is stopped.`,
 
 // NewMemory - Create a buffer held in memory.
 func NewMemory(config Config, log log.Modular, stats metrics.Type) (Type, error) {
-	return NewOutputWrapper(impl.NewMemory(config.Memory), stats), nil
+	return NewParallelWrapper(config, parallel.NewMemory(config.Memory.Limit), log, stats), nil
 }
 
 //------------------------------------------------------------------------------

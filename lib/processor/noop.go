@@ -21,15 +21,15 @@
 package processor
 
 import (
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["noop"] = typeSpec{
+	Constructors["noop"] = TypeSpec{
 		constructor: NewNoop,
 		description: `
 Noop is a no-op processor that does nothing, the message passes through
@@ -44,15 +44,18 @@ type Noop struct {
 }
 
 // NewNoop returns a Noop processor.
-func NewNoop(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewNoop(
+	conf Config, mgr types.Manager, log log.Modular, stats metrics.Type,
+) (Type, error) {
 	return &Noop{}, nil
 }
 
 //------------------------------------------------------------------------------
 
 // ProcessMessage does nothing and returns the message unchanged.
-func (c *Noop) ProcessMessage(msg *types.Message) (*types.Message, types.Response, bool) {
-	return msg, nil, true
+func (c *Noop) ProcessMessage(msg types.Message) ([]types.Message, types.Response) {
+	msgs := [1]types.Message{msg}
+	return msgs[:], nil
 }
 
 //------------------------------------------------------------------------------

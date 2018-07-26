@@ -1,58 +1,73 @@
-.PHONY: all deps rpm docker clean-docker clean docs
-
-BENTHOS_PATH = github.com/Jeffail/benthos
+.PHONY: all deps rpm docker clean docs test test-race test-integration fmt lint install docker-zmq
 
 TAGS =
 
+INSTALL_DIR    = $(GOPATH)/bin
 DEST_DIR       = ./target
 PATHINSTBIN    = $(DEST_DIR)/bin
 PATHINSTDOCKER = $(DEST_DIR)/docker
 
 VERSION := $(shell git describe --tags || echo "v0.0.0")
-DATE    := $(shell date +"%c" | tr ' :' '__')
+DATE    := $(shell date +"%Y-%m-%dT%H:%M:%SZ")
 
-LDFLAGS = -X $(BENTHOS_PATH)/lib/util/service.Version=$(VERSION) \
-	-X $(BENTHOS_PATH)/lib/util/service.DateBuilt=$(DATE)
+VER_FLAGS = -X main.Version=$(VERSION) \
+	-X main.DateBuilt=$(DATE)
+
+LD_FLAGS =
 
 APPS = benthos
 all: $(APPS)
 
-$(PATHINSTBIN)/benthos: $(wildcard lib/*/*.go lib/*/*/*.go cmd/benthos/*.go)
+install: $(APPS)
+	@cp $(PATHINSTBIN)/* $(INSTALL_DIR)/
 
-$(PATHINSTBIN)/%:
+$(PATHINSTBIN)/%: $(wildcard lib/*/*.go lib/*/*/*.go lib/*/*/*/*.go cmd/*/*.go)
 	@mkdir -p $(dir $@)
-	@go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o $@ ./cmd/$*
+	@go build -tags "$(TAGS)" -ldflags "$(LD_FLAGS) $(VER_FLAGS)" -o $@ ./cmd/$*
 
 $(APPS): %: $(PATHINSTBIN)/%
 
-$(PATHINSTDOCKER)/benthos.tar:
-	@mkdir -p $(dir $@)
-	@docker build -f ./resources/docker/Dockerfile . -t benthos:$(VERSION)
-	@docker tag benthos:$(VERSION) benthos:latest
-	@docker tag benthos:latest jeffail/benthos:latest
-	@docker save benthos:$(VERSION) > $@
+docker:
+	@docker rmi jeffail/benthos:$(VERSION); true
+	@docker build -f ./resources/docker/Dockerfile . -t jeffail/benthos:$(VERSION)
+	@docker rmi jeffail/benthos:latest; true
+	@docker tag jeffail/benthos:$(VERSION) jeffail/benthos:latest
 
-docker: $(PATHINSTDOCKER)/benthos.tar
+docker-zmq:
+	@docker rmi jeffail/benthos:$(VERSION)-zmq; true
+	@docker build -f ./resources/docker/Dockerfile.zmq . -t jeffail/benthos:$(VERSION)-zmq
 
 deps:
-	@go get -u github.com/golang/dep/cmd/dep
-	@dep ensure
+	@go get github.com/golang/dep/cmd/dep
+	@$$GOPATH/bin/dep ensure
 
-rpm:
-	@rpmbuild --define "_version $(VERSION)" -bb ./resources/rpm/benthos.spec
+fmt:
+	@go list ./... | xargs -I{} gofmt -w -s $$GOPATH/src/{}
+
+lint:
+	@go vet ./...
+	@golint ./cmd/... ./lib/...
+
+test:
+	@go test -short ./...
+
+test-race:
+	@go test -short -race ./...
+
+test-integration:
+	@go test -timeout 300s ./...
 
 clean:
 	rm -rf $(PATHINSTBIN)
-
-clean-docker:
+	rm -rf $(DEST_DIR)/dist
 	rm -rf $(PATHINSTDOCKER)
-	docker rmi jeffail/benthos; true
-	docker rmi benthos:latest; true
-	docker rmi benthos:$(VERSION); true
 
 docs: $(APPS)
-	@$(PATHINSTBIN)/benthos --print-yaml > ./config/everything.yaml; true
-	@$(PATHINSTBIN)/benthos --list-inputs > ./resources/docs/inputs/list.md; true
-	@$(PATHINSTBIN)/benthos --list-processors > ./resources/docs/processors/list.md; true
-	@$(PATHINSTBIN)/benthos --list-buffers > ./resources/docs/buffers/list.md; true
-	@$(PATHINSTBIN)/benthos --list-outputs > ./resources/docs/outputs/list.md; true
+	@$(PATHINSTBIN)/benthos --print-yaml --all > ./config/everything.yaml; true
+	@$(PATHINSTBIN)/benthos --list-inputs > ./docs/inputs/README.md; true
+	@$(PATHINSTBIN)/benthos --list-processors > ./docs/processors/README.md; true
+	@$(PATHINSTBIN)/benthos --list-conditions > ./docs/conditions/README.md; true
+	@$(PATHINSTBIN)/benthos --list-buffers > ./docs/buffers/README.md; true
+	@$(PATHINSTBIN)/benthos --list-outputs > ./docs/outputs/README.md; true
+	@$(PATHINSTBIN)/benthos --list-caches > ./docs/caches/README.md; true
+	@go run ./cmd/tools/benthos_config_gen/main.go

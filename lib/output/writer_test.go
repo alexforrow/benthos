@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Ashley Jeffs
+// Copyright (c) 2018 Ashley Jeffs
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -21,169 +21,552 @@
 package output
 
 import (
-	"bytes"
+	"errors"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
-type testBuffer struct {
-	bytes.Buffer
+//------------------------------------------------------------------------------
 
-	closed bool
+type mockWriter struct {
+	resToSnd error
+	msgRcvd  types.Message
+
+	connChan  chan error
+	writeChan chan error
 }
 
-func (t *testBuffer) Close() error {
-	t.closed = true
+func newMockWriter() *mockWriter {
+	return &mockWriter{
+		connChan:  make(chan error),
+		writeChan: make(chan error),
+	}
+}
+
+func (w *mockWriter) Connect() error {
+	return <-w.connChan
+}
+func (w *mockWriter) Write(msg types.Message) error {
+	w.msgRcvd = msg
+	return <-w.writeChan
+}
+func (w *mockWriter) CloseAsync() {}
+func (w *mockWriter) WaitForClose(time.Duration) error {
 	return nil
 }
 
-func TestWriterBasic(t *testing.T) {
-	var buf testBuffer
+//------------------------------------------------------------------------------
 
-	msgChan := make(chan types.Message)
+type writerCantConnect struct{}
 
-	writer, err := newWriter(&buf, []byte{}, log.NewLogger(os.Stdout, logConfig), metrics.DudType{})
+func (w writerCantConnect) Connect() error { return types.ErrNotConnected }
+func (w writerCantConnect) Write(msg types.Message) error {
+	return types.ErrNotConnected
+}
+func (w writerCantConnect) CloseAsync() {}
+func (w writerCantConnect) WaitForClose(time.Duration) error {
+	return nil
+}
+
+func TestWriterCantConnect(t *testing.T) {
+	t.Parallel()
+
+	w, err := NewWriter(
+		"foo", writerCantConnect{},
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	if err = writer.StartReceiving(msgChan); err != nil {
+	if err = w.Consume(make(chan types.Transaction)); err != nil {
 		t.Error(err)
 	}
-	if err = writer.StartReceiving(msgChan); err == nil {
+	if err = w.Consume(nil); err == nil {
 		t.Error("Expected error from duplicate receiver call")
 	}
 
-	testCases := []struct {
-		message        []string
-		expectedOutput string
-	}{
-		{
-			[]string{`hello world`},
-			"hello world\n",
-		},
-		{
-			[]string{`hello world`, `part 2`},
-			"hello world\npart 2\n\n",
-		},
-	}
-
-	for _, c := range testCases {
-		msg := types.Message{}
-		for _, part := range c.message {
-			msg.Parts = append(msg.Parts, []byte(part))
-		}
-
-		select {
-		case msgChan <- msg:
-		case <-time.After(time.Second):
-			t.Error("Timed out sending message")
-		}
-
-		select {
-		case res, open := <-writer.ResponseChan():
-			if !open {
-				t.Error("writer closed early")
-				return
-			}
-			if res.Error() != nil {
-				t.Error(res.Error())
-			}
-		case <-time.After(time.Second):
-			t.Error("Timed out waiting for response")
-		}
-
-		if exp, act := c.expectedOutput, buf.String(); exp != act {
-			t.Errorf("Unexpected output from writer: %v != %v", exp, act)
-		}
-		buf.Reset()
-	}
-
-	writer.CloseAsync()
-	if err = writer.WaitForClose(time.Second); err != nil {
+	// We will fail to connect but should still exit immediately.
+	w.CloseAsync()
+	if err = w.WaitForClose(time.Second); err != nil {
 		t.Error(err)
-	}
-
-	if !buf.closed {
-		t.Error("Buffer was not closed by writer")
 	}
 }
 
-func TestWriterCustomDelim(t *testing.T) {
-	var buf testBuffer
+//------------------------------------------------------------------------------
 
-	msgChan := make(chan types.Message)
+type writerCantSend struct {
+	connected int
+}
 
-	writer, err := newWriter(&buf, []byte("<FOO>"), log.NewLogger(os.Stdout, logConfig), metrics.DudType{})
+func (w *writerCantSend) Connect() error {
+	w.connected++
+	return nil
+}
+func (w *writerCantSend) Write(msg types.Message) error {
+	return types.ErrNotConnected
+}
+func (w *writerCantSend) CloseAsync() {}
+func (w *writerCantSend) WaitForClose(time.Duration) error {
+	return nil
+}
+
+func TestWriterCantSendClosed(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := &writerCantSend{}
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	if err = writer.StartReceiving(msgChan); err != nil {
-		t.Error(err)
-	}
-	if err = writer.StartReceiving(msgChan); err == nil {
-		t.Error("Expected error from duplicate receiver call")
-	}
+	msgChan := make(chan types.Transaction)
 
-	testCases := []struct {
-		message        []string
-		expectedOutput string
-	}{
-		{
-			[]string{`hello world`},
-			"hello world<FOO>",
-		},
-		{
-			[]string{`hello world`, `part 2`},
-			"hello world<FOO>part 2<FOO><FOO>",
-		},
-	}
-
-	for _, c := range testCases {
-		msg := types.Message{}
-		for _, part := range c.message {
-			msg.Parts = append(msg.Parts, []byte(part))
-		}
-
-		select {
-		case msgChan <- msg:
-		case <-time.After(time.Second):
-			t.Error("Timed out sending message")
-		}
-
-		select {
-		case res, open := <-writer.ResponseChan():
-			if !open {
-				t.Error("writer closed early")
-				return
-			}
-			if res.Error() != nil {
-				t.Error(res.Error())
-			}
-		case <-time.After(time.Second):
-			t.Error("Timed out waiting for response")
-		}
-
-		if exp, act := c.expectedOutput, buf.String(); exp != act {
-			t.Errorf("Unexpected output from writer: %v != %v", exp, act)
-		}
-		buf.Reset()
-	}
-
-	writer.CloseAsync()
-	if err = writer.WaitForClose(time.Second); err != nil {
+	if err = w.Consume(msgChan); err != nil {
 		t.Error(err)
 	}
 
-	if !buf.closed {
-		t.Error("Buffer was not closed by writer")
+	w.CloseAsync()
+	if err = w.WaitForClose(time.Second); err != nil {
+		t.Error(err)
 	}
 }
+
+func TestWriterCantSendClosedChan(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := &writerCantSend{}
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	close(msgChan)
+	if err = w.WaitForClose(time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+//------------------------------------------------------------------------------
+
+func TestWriterStartClosed(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := newMockWriter()
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	select {
+	case writerImpl.connChan <- types.ErrTypeClosed:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	if err = w.WaitForClose(time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestWriterClosesOnReconn(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := newMockWriter()
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	select {
+	case writerImpl.connChan <- nil:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	go func() {
+		select {
+		case writerImpl.writeChan <- types.ErrNotConnected:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+		select {
+		case writerImpl.connChan <- types.ErrTypeClosed:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+	}()
+
+	select {
+	case msgChan <- types.NewTransaction(types.NewMessage(nil), resChan):
+	case <-time.After(time.Second):
+		t.Error("Timed out")
+	}
+
+	if err = w.WaitForClose(time.Second * 5); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestWriterClosesOnResend(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := newMockWriter()
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	select {
+	case writerImpl.connChan <- nil:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	go func() {
+		select {
+		case writerImpl.writeChan <- types.ErrNotConnected:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+		select {
+		case writerImpl.connChan <- nil:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+		select {
+		case writerImpl.writeChan <- types.ErrTypeClosed:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+	}()
+
+	select {
+	case msgChan <- types.NewTransaction(types.NewMessage(nil), resChan):
+	case <-time.After(time.Second):
+		t.Error("Timed out")
+	}
+
+	if err = w.WaitForClose(time.Second * 5); err != nil {
+		t.Error(err)
+	}
+}
+
+//------------------------------------------------------------------------------
+
+func TestWriterCanReconnect(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := newMockWriter()
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	select {
+	case writerImpl.connChan <- nil:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	go func() {
+		select {
+		case writerImpl.writeChan <- types.ErrNotConnected:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+		select {
+		case writerImpl.connChan <- nil:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+		select {
+		case writerImpl.writeChan <- nil:
+		case <-time.After(time.Second):
+			t.Fatal("Timed out")
+		}
+	}()
+
+	select {
+	case msgChan <- types.NewTransaction(types.NewMessage(nil), resChan):
+	case <-time.After(time.Second):
+		t.Error("Timed out")
+	}
+	select {
+	case res, open := <-resChan:
+		if !open {
+			t.Error("Res chan closed")
+		}
+		if err := res.Error(); err != nil {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		t.Error("Timed out")
+	}
+
+	// We will be failing to send but should still exit immediately.
+	w.CloseAsync()
+	if err = w.WaitForClose(time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestWriterCantReconnect(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := newMockWriter()
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	go func() {
+		select {
+		case msgChan <- types.NewTransaction(types.NewMessage(nil), resChan):
+		case <-time.After(time.Second):
+			t.Error("Timed out")
+		}
+	}()
+
+	select {
+	case writerImpl.connChan <- nil:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+	select {
+	case writerImpl.writeChan <- types.ErrNotConnected:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+	select {
+	case writerImpl.connChan <- types.ErrNotConnected:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	// We will be failing to send but should still exit immediately.
+	w.CloseAsync()
+	if err = w.WaitForClose(time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestWriterHappyPath(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := newMockWriter()
+
+	exp := [][]byte{[]byte("foo"), []byte("bar")}
+	expErr := error(nil)
+
+	writerImpl.resToSnd = expErr
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	go func() {
+		select {
+		case msgChan <- types.NewTransaction(types.NewMessage(exp), resChan):
+		case <-time.After(time.Second):
+			t.Error("Timed out")
+		}
+	}()
+
+	select {
+	case writerImpl.connChan <- nil:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+	select {
+	case writerImpl.writeChan <- expErr:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	select {
+	case res, open := <-resChan:
+		if !open {
+			t.Fatal("Chan closed")
+		}
+		if actErr := res.Error(); expErr != actErr {
+			t.Errorf("Wrong response: %v != %v", actErr, expErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	// We will be failing to send but should still exit immediately.
+	w.CloseAsync()
+	if err = w.WaitForClose(time.Second); err != nil {
+		t.Error(err)
+	}
+
+	if act := writerImpl.msgRcvd.GetAll(); !reflect.DeepEqual(exp, act) {
+		t.Errorf("Wrong message sent: %v != %v", act, exp)
+	}
+}
+
+func TestWriterSadPath(t *testing.T) {
+	t.Parallel()
+
+	writerImpl := newMockWriter()
+
+	exp := [][]byte{[]byte("foo"), []byte("bar")}
+	expErr := errors.New("message got lost or something")
+
+	writerImpl.resToSnd = expErr
+
+	w, err := NewWriter(
+		"foo", writerImpl,
+		log.New(os.Stdout, logConfig), metrics.DudType{},
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	msgChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
+
+	if err = w.Consume(msgChan); err != nil {
+		t.Error(err)
+	}
+
+	go func() {
+		select {
+		case msgChan <- types.NewTransaction(types.NewMessage(exp), resChan):
+		case <-time.After(time.Second):
+			t.Error("Timed out")
+		}
+	}()
+
+	select {
+	case writerImpl.connChan <- nil:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+	select {
+	case writerImpl.writeChan <- expErr:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	select {
+	case res, open := <-resChan:
+		if !open {
+			t.Fatal("Chan closed")
+		}
+		if actErr := res.Error(); expErr != actErr {
+			t.Errorf("Wrong response: %v != %v", actErr, expErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Timed out")
+	}
+
+	// We will be failing to send but should still exit immediately.
+	w.CloseAsync()
+	if err = w.WaitForClose(time.Second); err != nil {
+		t.Error(err)
+	}
+
+	if act := writerImpl.msgRcvd.GetAll(); !reflect.DeepEqual(exp, act) {
+		t.Errorf("Wrong message sent: %v != %v", act, exp)
+	}
+}
+
+//------------------------------------------------------------------------------

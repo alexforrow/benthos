@@ -27,9 +27,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 func TestHTTPBasic(t *testing.T) {
@@ -39,19 +39,20 @@ func TestHTTPBasic(t *testing.T) {
 	conf.HTTPServer.Address = "localhost:1237"
 	conf.HTTPServer.Path = "/testpost"
 
-	h, err := NewHTTPServer(conf, log.NewLogger(os.Stdout, logConfig), metrics.DudType{})
+	h, err := NewHTTPServer(conf, nil, log.New(os.Stdout, logConfig), metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	msgChan := make(chan types.Message)
+	msgChan := make(chan types.Transaction)
+	resChan := make(chan types.Response)
 
-	if err = h.StartReceiving(msgChan); err != nil {
+	if err = h.Consume(msgChan); err != nil {
 		t.Error(err)
 		return
 	}
-	if err = h.StartReceiving(msgChan); err == nil {
+	if err = h.Consume(msgChan); err == nil {
 		t.Error("Expected error from double listen")
 	}
 
@@ -62,16 +63,15 @@ func TestHTTPBasic(t *testing.T) {
 		testStr := fmt.Sprintf("test%v", i)
 
 		go func() {
-			testMsg := types.NewMessage()
-			testMsg.Parts = [][]byte{[]byte(testStr)}
+			testMsg := types.NewMessage([][]byte{[]byte(testStr)})
 			select {
-			case msgChan <- testMsg:
+			case msgChan <- types.NewTransaction(testMsg, resChan):
 			case <-time.After(time.Second):
 				t.Error("Timed out waiting for message")
 				return
 			}
 			select {
-			case resMsg := <-h.ResponseChan():
+			case resMsg := <-resChan:
 				if resMsg.Error() != nil {
 					t.Error(resMsg.Error())
 				}
@@ -100,15 +100,15 @@ func TestHTTPBadRequests(t *testing.T) {
 	conf.HTTPServer.Address = "localhost:1236"
 	conf.HTTPServer.Path = "/testpost"
 
-	h, err := NewHTTPServer(conf, log.NewLogger(os.Stdout, logConfig), metrics.DudType{})
+	h, err := NewHTTPServer(conf, nil, log.New(os.Stdout, logConfig), metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	msgChan := make(chan types.Message)
+	msgChan := make(chan types.Transaction)
 
-	if err = h.StartReceiving(msgChan); err != nil {
+	if err = h.Consume(msgChan); err != nil {
 		t.Error(err)
 		return
 	}
@@ -132,15 +132,15 @@ func TestHTTPTimeout(t *testing.T) {
 	conf.HTTPServer.Path = "/testpost"
 	conf.HTTPServer.TimeoutMS = 1
 
-	h, err := NewHTTPServer(conf, log.NewLogger(os.Stdout, logConfig), metrics.DudType{})
+	h, err := NewHTTPServer(conf, nil, log.New(os.Stdout, logConfig), metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	msgChan := make(chan types.Message)
+	msgChan := make(chan types.Transaction)
 
-	if err = h.StartReceiving(msgChan); err != nil {
+	if err = h.Consume(msgChan); err != nil {
 		t.Error(err)
 		return
 	}

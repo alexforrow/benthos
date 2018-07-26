@@ -22,11 +22,12 @@ package processor
 
 import (
 	"os"
+	"reflect"
 	"testing"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 func TestBoundsCheck(t *testing.T) {
@@ -34,9 +35,10 @@ func TestBoundsCheck(t *testing.T) {
 	conf.BoundsCheck.MinParts = 2
 	conf.BoundsCheck.MaxParts = 3
 	conf.BoundsCheck.MaxPartSize = 10
+	conf.BoundsCheck.MinPartSize = 1
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewBoundsCheck(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewBoundsCheck(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -80,19 +82,23 @@ func TestBoundsCheck(t *testing.T) {
 			[]byte("num"),
 			[]byte("parts"),
 		},
+		{
+			[]byte("hello"),
+			[]byte(""),
+		},
 	}
 
 	for _, parts := range goodParts {
-		msg := &types.Message{Parts: parts}
-		if res, _, check := proc.ProcessMessage(msg); !check {
+		msg := types.NewMessage(parts)
+		if msgs, _ := proc.ProcessMessage(msg); len(msgs) == 0 {
 			t.Errorf("Bounds check failed on: %s", parts)
-		} else if res != msg {
+		} else if !reflect.DeepEqual(msgs[0], msg) {
 			t.Error("Wrong message returned (expected same)")
 		}
 	}
 
 	for _, parts := range badParts {
-		if _, res, check := proc.ProcessMessage(&types.Message{Parts: parts}); check {
+		if msgs, res := proc.ProcessMessage(types.NewMessage(parts)); len(msgs) > 0 {
 			t.Errorf("Bounds check didnt fail on: %s", parts)
 		} else if _, ok := res.(types.SimpleResponse); !ok {
 			t.Error("Expected simple response from bad message")

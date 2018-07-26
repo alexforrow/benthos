@@ -23,28 +23,26 @@ package output
 import (
 	"os"
 
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
+	"github.com/Jeffail/benthos/lib/types"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["file"] = typeSpec{
+	Constructors["file"] = TypeSpec{
 		constructor: NewFile,
 		description: `
 The file output type simply appends all messages to an output file. Single part
-messages are printed with a line separator '\n'. Multipart messages are written
-with each part line separated, with the final part followed by two line
-separators, e.g. a multipart message [ "foo", "bar", "baz" ] would be written
-as:
+messages are printed with a delimiter (defaults to '\n' if left empty).
+Multipart messages are written with each part delimited, with the final part
+followed by two delimiters, e.g. a multipart message [ "foo", "bar", "baz" ]
+would be written as:
 
 foo\n
 bar\n
-baz\n\n
-
-You can alternatively specify a custom delimiter that will follow the same rules
-as '\n' above.`,
+baz\n\n`,
 	}
 }
 
@@ -52,27 +50,27 @@ as '\n' above.`,
 
 // FileConfig is configuration values for the file based output type.
 type FileConfig struct {
-	Path        string `json:"path" yaml:"path"`
-	CustomDelim string `json:"custom_delimiter" yaml:"custom_delimiter"`
+	Path  string `json:"path" yaml:"path"`
+	Delim string `json:"delimiter" yaml:"delimiter"`
 }
 
 // NewFileConfig creates a new FileConfig with default values.
 func NewFileConfig() FileConfig {
 	return FileConfig{
-		Path:        "",
-		CustomDelim: "",
+		Path:  "",
+		Delim: "",
 	}
 }
 
 //------------------------------------------------------------------------------
 
 // NewFile creates a new File output type.
-func NewFile(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewFile(conf Config, mgr types.Manager, log log.Modular, stats metrics.Type) (Type, error) {
 	file, err := os.OpenFile(conf.File.Path, os.O_CREATE|os.O_RDWR|os.O_APPEND, os.FileMode(0666))
 	if err != nil {
 		return nil, err
 	}
-	return newWriter(file, []byte(conf.File.CustomDelim), log, stats)
+	return NewLineWriter(file, true, []byte(conf.File.Delim), "file", log, stats)
 }
 
 //------------------------------------------------------------------------------

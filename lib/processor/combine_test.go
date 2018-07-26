@@ -21,21 +21,22 @@
 package processor
 
 import (
+	"math/rand"
 	"os"
 	"reflect"
 	"testing"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 func TestCombineTwoParts(t *testing.T) {
 	conf := NewConfig()
 	conf.Combine.Parts = 2
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewCombine(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewCombine(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -43,15 +44,54 @@ func TestCombineTwoParts(t *testing.T) {
 
 	exp := [][]byte{[]byte("foo"), []byte("bar")}
 
-	msg, res, check := proc.ProcessMessage(&types.Message{Parts: exp})
-	if !check {
+	msgs, res := proc.ProcessMessage(types.NewMessage(exp))
+	if len(msgs) != 1 {
 		t.Error("Expected success")
 	}
-	if !reflect.DeepEqual(exp, msg.Parts) {
-		t.Errorf("Wrong result: %s != %s", msg.Parts, exp)
+	if !reflect.DeepEqual(exp, msgs[0].GetAll()) {
+		t.Errorf("Wrong result: %s != %s", msgs[0].GetAll(), exp)
 	}
 	if res != nil {
 		t.Error("Expected nil res")
+	}
+}
+
+func BenchmarkCombineMultiMessagesSharedBuffer(b *testing.B) {
+	conf := NewConfig()
+	conf.Combine.Parts = 3
+
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewCombine(conf, nil, testLog, metrics.DudType{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	var expParts [][]byte
+
+	blobSizes := []int{100 * 1024, 200 * 1024}
+	for _, bSize := range blobSizes {
+		dataBlob := make([]byte, bSize)
+		for i := range dataBlob {
+			dataBlob[i] = byte(rand.Int())
+		}
+		expParts = append(expParts, dataBlob)
+	}
+
+	inputMsg := types.NewMessage(expParts)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	// For each loop we add three parts of a message.
+	for i := 0; i < b.N; i++ {
+		msgs, res := proc.ProcessMessage(inputMsg)
+		if len(msgs) != 1 {
+			if err := res.Error(); err != nil {
+				b.Error(err)
+			}
+		} else if exp, act := 3, len(msgs[0].GetAll()); exp != act {
+			b.Errorf("Wrong parts count: %v != %v\n", act, exp)
+		}
 	}
 }
 
@@ -59,8 +99,8 @@ func TestCombineLotsOfParts(t *testing.T) {
 	conf := NewConfig()
 	conf.Combine.Parts = 2
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewCombine(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewCombine(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -70,14 +110,13 @@ func TestCombineLotsOfParts(t *testing.T) {
 		[]byte("foo"), []byte("bar"), []byte("bar2"),
 		[]byte("bar3"), []byte("bar4"), []byte("bar5"),
 	}
-	exp := [][]byte{[]byte("foo"), []byte("bar")}
 
-	msg, res, check := proc.ProcessMessage(&types.Message{Parts: input})
-	if !check {
+	msgs, res := proc.ProcessMessage(types.NewMessage(input))
+	if len(msgs) != 1 {
 		t.Error("Expected success")
 	}
-	if !reflect.DeepEqual(exp, msg.Parts) {
-		t.Errorf("Wrong result: %s != %s", msg.Parts, exp)
+	if !reflect.DeepEqual(input, msgs[0].GetAll()) {
+		t.Errorf("Wrong result: %s != %s", msgs[0].GetAll(), input)
 	}
 	if res != nil {
 		t.Error("Expected nil res")
@@ -88,8 +127,8 @@ func TestCombineTwoSingleParts(t *testing.T) {
 	conf := NewConfig()
 	conf.Combine.Parts = 2
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewCombine(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewCombine(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -97,23 +136,20 @@ func TestCombineTwoSingleParts(t *testing.T) {
 
 	exp := [][]byte{[]byte("foo1"), []byte("bar1")}
 
-	msg, res, check := proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[0]}})
-	if check {
+	msgs, res := proc.ProcessMessage(types.NewMessage([][]byte{exp[0]}))
+	if len(msgs) != 0 {
 		t.Error("Expected fail on one part")
-	}
-	if msg != nil {
-		t.Error("Expected nil msg")
 	}
 	if !res.SkipAck() {
 		t.Error("Expected skip ack")
 	}
 
-	msg, res, check = proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[1]}})
-	if !check {
+	msgs, res = proc.ProcessMessage(types.NewMessage([][]byte{exp[1]}))
+	if len(msgs) != 1 {
 		t.Error("Expected success")
 	}
-	if !reflect.DeepEqual(exp, msg.Parts) {
-		t.Errorf("Wrong result: %s != %s", msg.Parts, exp)
+	if !reflect.DeepEqual(exp, msgs[0].GetAll()) {
+		t.Errorf("Wrong result: %s != %s", msgs[0].GetAll(), exp)
 	}
 	if res != nil {
 		t.Error("Expected nil res")
@@ -121,23 +157,20 @@ func TestCombineTwoSingleParts(t *testing.T) {
 
 	exp = [][]byte{[]byte("foo2"), []byte("bar2")}
 
-	msg, res, check = proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[0]}})
-	if check {
+	msgs, res = proc.ProcessMessage(types.NewMessage([][]byte{exp[0]}))
+	if len(msgs) != 0 {
 		t.Error("Expected fail on one part")
-	}
-	if msg != nil {
-		t.Error("Expected nil msg")
 	}
 	if !res.SkipAck() {
 		t.Error("Expected skip ack")
 	}
 
-	msg, res, check = proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[1]}})
-	if !check {
+	msgs, res = proc.ProcessMessage(types.NewMessage([][]byte{exp[1]}))
+	if len(msgs) != 1 {
 		t.Error("Expected success")
 	}
-	if !reflect.DeepEqual(exp, msg.Parts) {
-		t.Errorf("Wrong result: %s != %s", msg.Parts, exp)
+	if !reflect.DeepEqual(exp, msgs[0].GetAll()) {
+		t.Errorf("Wrong result: %s != %s", msgs[0].GetAll(), exp)
 	}
 	if res != nil {
 		t.Error("Expected nil res")
@@ -148,54 +181,56 @@ func TestCombineTwoDiffParts(t *testing.T) {
 	conf := NewConfig()
 	conf.Combine.Parts = 2
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewCombine(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewCombine(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	exp := [][]byte{[]byte("foo1"), []byte("bar1")}
+	input := [][]byte{[]byte("foo1"), []byte("bar1")}
+	exp := [][]byte{[]byte("foo1"), []byte("bar1"), []byte("foo1")}
 
-	msg, res, check := proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[0]}})
-	if check {
+	msgs, res := proc.ProcessMessage(types.NewMessage([][]byte{input[0]}))
+	if len(msgs) != 0 {
 		t.Error("Expected fail on one part")
-	}
-	if msg != nil {
-		t.Error("Expected nil msg")
 	}
 	if !res.SkipAck() {
 		t.Error("Expected skip ack")
 	}
 
-	msg, res, check = proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[1], exp[0]}})
-	if !check {
+	msgs, res = proc.ProcessMessage(types.NewMessage([][]byte{input[1], input[0]}))
+	if len(msgs) != 1 {
 		t.Error("Expected success")
 	}
-	if !reflect.DeepEqual(exp, msg.Parts) {
-		t.Errorf("Wrong result: %s != %s", msg.Parts, exp)
+	if !reflect.DeepEqual(exp, msgs[0].GetAll()) {
+		t.Errorf("Wrong result: %s != %s", msgs[0].GetAll(), exp)
 	}
 	if res != nil {
 		t.Error("Expected nil res")
 	}
 
-	msg, res, check = proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[1], exp[0]}})
-	if !check {
+	exp = [][]byte{[]byte("bar1"), []byte("foo1")}
+
+	msgs, res = proc.ProcessMessage(types.NewMessage([][]byte{input[1], input[0]}))
+	if len(msgs) != 1 {
 		t.Error("Expected success")
 	}
-	if !reflect.DeepEqual(exp, msg.Parts) {
-		t.Errorf("Wrong result: %s != %s", msg.Parts, exp)
+	if !reflect.DeepEqual(exp, msgs[0].GetAll()) {
+		t.Errorf("Wrong result: %s != %s", msgs[0].GetAll(), exp)
 	}
 	if res != nil {
 		t.Error("Expected nil res")
 	}
 
-	msg, res, check = proc.ProcessMessage(&types.Message{Parts: [][]byte{exp[1]}})
-	if !check {
+	exp = [][]byte{[]byte("bar1"), []byte("foo1"), []byte("bar1")}
+
+	msgs, res = proc.ProcessMessage(types.NewMessage([][]byte{input[1], input[0], input[1]}))
+	if len(msgs) != 1 {
 		t.Error("Expected success")
 	}
-	if !reflect.DeepEqual(exp, msg.Parts) {
-		t.Errorf("Wrong result: %s != %s", msg.Parts, exp)
+	if !reflect.DeepEqual(exp, msgs[0].GetAll()) {
+		t.Errorf("Wrong result: %s != %s", msgs[0].GetAll(), exp)
 	}
 	if res != nil {
 		t.Error("Expected nil res")

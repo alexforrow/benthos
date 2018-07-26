@@ -22,9 +22,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	_ "net/http/pprof"
 	"runtime/pprof"
+	"strings"
 
 	"flag"
 	"net/http"
@@ -33,32 +34,41 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/api"
 	"github.com/Jeffail/benthos/lib/buffer"
+	"github.com/Jeffail/benthos/lib/cache"
 	"github.com/Jeffail/benthos/lib/input"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/manager"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/output"
+	"github.com/Jeffail/benthos/lib/pipeline"
 	"github.com/Jeffail/benthos/lib/processor"
-	"github.com/Jeffail/benthos/lib/util"
-	"github.com/Jeffail/benthos/lib/util/service"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/processor/condition"
+	"github.com/Jeffail/benthos/lib/stream"
+	strmmgr "github.com/Jeffail/benthos/lib/stream/manager"
+	"github.com/Jeffail/benthos/lib/util/config"
+	yaml "gopkg.in/yaml.v2"
 )
 
 //------------------------------------------------------------------------------
 
-type httpConfig struct {
-	Address       string `json:"address" yaml:"address"`
-	ReadTimeoutMS int    `json:"read_timeout_ms" yaml:"read_timeout_ms"`
-}
+// Build stamps.
+var (
+	Version   string
+	DateBuilt string
+)
+
+//------------------------------------------------------------------------------
 
 // Config is the benthos configuration struct.
 type Config struct {
-	HTTP                 httpConfig       `json:"http"`
-	Input                input.Config     `json:"input" yaml:"input"`
-	Output               output.Config    `json:"output" yaml:"output"`
-	Buffer               buffer.Config    `json:"buffer" yaml:"buffer"`
-	Logger               log.LoggerConfig `json:"logger" yaml:"logger"`
-	Metrics              metrics.Config   `json:"metrics" yaml:"metrics"`
-	SystemCloseTimeoutMS int              `json:"sys_exit_timeout_ms" yaml:"sys_exit_timeout_ms"`
+	HTTP                 api.Config `json:"http" yaml:"http"`
+	stream.Config        `json:",inline" yaml:",inline"`
+	Manager              manager.Config `json:"resources" yaml:"resources"`
+	Logger               log.Config     `json:"logger" yaml:"logger"`
+	Metrics              metrics.Config `json:"metrics" yaml:"metrics"`
+	SystemCloseTimeoutMS int            `json:"sys_exit_timeout_ms" yaml:"sys_exit_timeout_ms"`
 }
 
 // NewConfig returns a new configuration with default values.
@@ -67,23 +77,106 @@ func NewConfig() Config {
 	metricsConf.Prefix = "benthos"
 
 	return Config{
-		HTTP: httpConfig{
-			Address:       "0.0.0.0:4195",
-			ReadTimeoutMS: 5000,
-		},
-		Input:                input.NewConfig(),
-		Output:               output.NewConfig(),
-		Buffer:               buffer.NewConfig(),
-		Logger:               log.NewLoggerConfig(),
+		HTTP:                 api.NewConfig(),
+		Config:               stream.NewConfig(),
+		Manager:              manager.NewConfig(),
+		Logger:               log.NewConfig(),
 		Metrics:              metricsConf,
 		SystemCloseTimeoutMS: 20000,
 	}
+}
+
+// Sanitised returns a sanitised copy of the Benthos configuration, meaning
+// fields of no consequence (unused inputs, outputs, processors etc) are
+// excluded.
+func (c Config) Sanitised() (interface{}, error) {
+	inConf, err := input.SanitiseConfig(c.Input)
+	if err != nil {
+		return nil, err
+	}
+
+	var pipeConf interface{}
+	pipeConf, err = pipeline.SanitiseConfig(c.Pipeline)
+	if err != nil {
+		return nil, err
+	}
+
+	var outConf interface{}
+	outConf, err = output.SanitiseConfig(c.Output)
+	if err != nil {
+		return nil, err
+	}
+
+	var bufConf interface{}
+	bufConf, err = buffer.SanitiseConfig(c.Buffer)
+	if err != nil {
+		return nil, err
+	}
+
+	var metConf interface{}
+	metConf, err = metrics.SanitiseConfig(c.Metrics)
+	if err != nil {
+		return nil, err
+	}
+
+	return struct {
+		HTTP                 interface{} `json:"http" yaml:"http"`
+		Input                interface{} `json:"input" yaml:"input"`
+		Buffer               interface{} `json:"buffer" yaml:"buffer"`
+		Pipeline             interface{} `json:"pipeline" yaml:"pipeline"`
+		Output               interface{} `json:"output" yaml:"output"`
+		Manager              interface{} `json:"resources" yaml:"resources"`
+		Logger               interface{} `json:"logger" yaml:"logger"`
+		Metrics              interface{} `json:"metrics" yaml:"metrics"`
+		SystemCloseTimeoutMS interface{} `json:"sys_exit_timeout_ms" yaml:"sys_exit_timeout_ms"`
+	}{
+		HTTP:                 c.HTTP,
+		Input:                inConf,
+		Buffer:               bufConf,
+		Pipeline:             pipeConf,
+		Output:               outConf,
+		Manager:              c.Manager,
+		Logger:               c.Logger,
+		Metrics:              metConf,
+		SystemCloseTimeoutMS: c.SystemCloseTimeoutMS,
+	}, nil
 }
 
 //------------------------------------------------------------------------------
 
 // Extra flags
 var (
+	showVersion = flag.Bool(
+		"version", false, "Display version info, then exit",
+	)
+	showConfigJSON = flag.Bool(
+		"print-json", false, "Print loaded configuration as JSON, then exit",
+	)
+	showConfigYAML = flag.Bool(
+		"print-yaml", false, "Print loaded configuration as YAML, then exit",
+	)
+	showAll = flag.Bool(
+		"all", false,
+		"Set whether _all_ fields should be shown when printing configuration"+
+			" via --print-yaml or --print-json, otherwise only used values"+
+			" will be printed.",
+	)
+	configPath = flag.String(
+		"c", "", "Path to a configuration file",
+	)
+	swapEnvs = flag.Bool(
+		"swap-envs", true,
+		"Swap ${FOO} patterns in config file with environment variables",
+	)
+	examples = flag.String(
+		"examples", "",
+		"Add specific examples when printing a configuration file with"+
+			" `--print-yaml` or `--print-json` by listing comma separated"+
+			" types. Types can be any input, buffer, processor or output. For"+
+			" example: `benthos --print-yaml --examples websocket,jmespath`"+
+			" would print a config with a websocket input and output and a"+
+			" jmespath processor.",
+	)
 	printInputs = flag.Bool(
 		"list-inputs", false,
 		"Print a list of available input options, then exit",
@@ -100,14 +193,83 @@ var (
 		"list-processors", false,
 		"Print a list of available processor options, then exit",
 	)
+	printConditions = flag.Bool(
+		"list-conditions", false,
+		"Print a list of available processor condition options, then exit",
+	)
+	printCaches = flag.Bool(
+		"list-caches", false,
+		"Print a list of available cache options, then exit",
+	)
+	streamsMode = flag.Bool(
+		"streams", false,
+		"Run Benthos in streams mode, where streams can be created, updated"+
+			" and removed via REST HTTP endpoints. In streams mode the stream"+
+			" fields of a config file (input, buffer, pipeline, output) will"+
+			" be ignored. Instead, any .yaml or .json files inside the"+
+			" --streams-dir directory will be parsed as stream configs.",
+	)
+	streamsDir = flag.String(
+		"streams-dir", "/benthos/streams",
+		"When running Benthos in streams mode any files in this directory with"+
+			" a .json or .yaml extension will be parsed as a stream"+
+			" configuration (input, buffer, pipeline, output), where the"+
+			" filename less the extension will be the id of the stream.",
+	)
 )
 
 //------------------------------------------------------------------------------
 
+func addExamples(examples string, conf *Config) {
+	var inputType, bufferType, conditionType, outputType string
+	var processorTypes []string
+	for _, e := range strings.Split(examples, ",") {
+		if _, exists := input.Constructors[e]; exists && len(inputType) == 0 {
+			inputType = e
+		}
+		if _, exists := buffer.Constructors[e]; exists {
+			bufferType = e
+		}
+		if _, exists := processor.Constructors[e]; exists {
+			processorTypes = append(processorTypes, e)
+		}
+		if _, exists := condition.Constructors[e]; exists {
+			conditionType = e
+		}
+		if _, exists := output.Constructors[e]; exists {
+			outputType = e
+		}
+	}
+	if len(inputType) > 0 {
+		conf.Input.Type = inputType
+	}
+	if len(bufferType) > 0 {
+		conf.Buffer.Type = bufferType
+	}
+	if len(processorTypes) > 0 {
+		for _, procType := range processorTypes {
+			procConf := processor.NewConfig()
+			procConf.Type = procType
+			conf.Pipeline.Processors = append(conf.Pipeline.Processors, procConf)
+		}
+	}
+	if len(conditionType) > 0 {
+		condConf := condition.NewConfig()
+		condConf.Type = conditionType
+		procConf := processor.NewConfig()
+		procConf.Type = "filter"
+		procConf.Filter.Config = condConf
+		conf.Pipeline.Processors = append(conf.Pipeline.Processors, procConf)
+	}
+	if len(outputType) > 0 {
+		conf.Output.Type = outputType
+	}
+}
+
 // bootstrap reads cmd args and either parses and config file or prints helper
 // text and exits.
 func bootstrap() Config {
-	config := NewConfig()
+	conf := NewConfig()
 
 	// A list of default config paths to check for if not explicitly defined
 	defaultPaths := []string{
@@ -127,18 +289,85 @@ func bootstrap() Config {
 				"For a list of available buffer options use --list-buffers\n")
 	}
 
-	// Load configuration etc
-	if !service.Bootstrap(&config, defaultPaths...) {
+	flag.Parse()
+
+	// If the user wants the version we print it.
+	if *showVersion {
+		fmt.Printf("Version: %v\nDate: %v\n", Version, DateBuilt)
 		os.Exit(0)
 	}
 
+	if len(*configPath) > 0 {
+		if err := config.Read(*configPath, *swapEnvs, &conf); err != nil {
+			fmt.Fprintf(os.Stderr, "Configuration file read error: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Iterate default config paths
+		for _, path := range defaultPaths {
+			if _, err := os.Stat(path); err == nil {
+				fmt.Fprintf(os.Stderr, "Config file not specified, reading from %v\n", path)
+
+				if err = config.Read(path, *swapEnvs, &conf); err != nil {
+					fmt.Fprintf(os.Stderr, "Configuration file read error: %v\n", err)
+					os.Exit(1)
+				}
+				break
+			}
+		}
+	}
+
+	// If the user wants the configuration to be printed we do so and then exit.
+	if *showConfigJSON || *showConfigYAML {
+		var outConf interface{}
+		var err error
+
+		if len(*examples) > 0 {
+			addExamples(*examples, &conf)
+		}
+
+		if !*showAll {
+			if outConf, err = conf.Sanitised(); err != nil {
+				fmt.Fprintln(os.Stderr, fmt.Sprintf("Configuration sanitise error: %v", err))
+				os.Exit(1)
+			}
+		} else {
+			if len(conf.Input.Processors) == 0 &&
+				len(conf.Pipeline.Processors) == 0 &&
+				len(conf.Output.Processors) == 0 {
+				conf.Pipeline.Processors = append(conf.Pipeline.Processors, processor.NewConfig())
+			}
+			manager.AddExamples(&conf.Manager)
+			outConf = conf
+		}
+
+		if *showConfigJSON {
+			if configJSON, err := json.Marshal(outConf); err == nil {
+				fmt.Println(string(configJSON))
+			} else {
+				fmt.Fprintln(os.Stderr, fmt.Sprintf("Configuration marshal error: %v", err))
+			}
+			os.Exit(0)
+		} else {
+			if configYAML, err := yaml.Marshal(outConf); err == nil {
+				fmt.Println(string(configYAML))
+			} else {
+				fmt.Fprintln(os.Stderr, fmt.Sprintf("Configuration marshal error: %v", err))
+			}
+			os.Exit(0)
+		}
+	}
+
 	// If we only want to print our inputs or outputs we should exit afterwards
-	if *printInputs || *printOutputs || *printBuffers || *printProcessors {
+	if *printInputs || *printOutputs || *printBuffers || *printProcessors || *printConditions || *printCaches {
 		if *printInputs {
 			fmt.Println(input.Descriptions())
 		}
 		if *printProcessors {
 			fmt.Println(processor.Descriptions())
+		}
+		if *printConditions {
+			fmt.Println(condition.Descriptions())
 		}
 		if *printBuffers {
 			fmt.Println(buffer.Descriptions())
@@ -146,107 +375,103 @@ func bootstrap() Config {
 		if *printOutputs {
 			fmt.Println(output.Descriptions())
 		}
-		os.Exit(1)
+		if *printCaches {
+			fmt.Println(cache.Descriptions())
+		}
+		os.Exit(0)
 	}
 
-	return config
+	return conf
 }
 
-// createPipeline creates a pipeline based on the supplied configuration file,
-// and return a closable pool of pipeline objects, a channel indicating that all
-// inputs and outputs have seized, or an error.
-func createPipeline(
-	config Config, logger log.Modular, stats metrics.Type,
-) (*util.ClosablePool, *util.ClosablePool, chan struct{}, error) {
-	// Create two pools, this helps manage ordered closure of all pipeline
-	// components. We have a tiered (t1) and an non-tiered (t2) pool. If the
-	// tiered pool cannot close within our allotted time period then we try
-	// closing the second non-tiered pool. If the second pool also fails then we
-	// exit the service ungracefully.
-	poolt1, poolt2 := util.NewClosablePool(), util.NewClosablePool()
-
-	// Create our input pipe
-	inputPipe, err := input.New(config.Input, logger, stats)
-	if err != nil {
-		logger.Errorf("Input error (%s): %v\n", config.Input.Type, err)
-		return nil, nil, nil, err
-	}
-	poolt1.Add(1, inputPipe)
-	poolt2.Add(0, inputPipe)
-
-	// Create a buffer
-	buf, err := buffer.New(config.Buffer, logger, stats)
-	if err != nil {
-		logger.Errorf("Buffer error (%s): %v\n", config.Buffer.Type, err)
-		return nil, nil, nil, err
-	}
-	poolt1.Add(3, buf)
-	poolt2.Add(0, buf)
-
-	// Create our output pipe
-	outputPipe, err := output.New(config.Output, logger, stats)
-	if err != nil {
-		logger.Errorf("Output error (%s): %v\n", config.Output.Type, err)
-		return nil, nil, nil, err
-	}
-	poolt1.Add(10, outputPipe)
-	poolt2.Add(0, outputPipe)
-
-	util.Couple(buf, outputPipe)
-	util.Couple(inputPipe, buf)
-	closeChan := make(chan struct{})
-
-	// If our outputs close down then we should shut down the service
-	go func() {
-		for {
-			if err := outputPipe.WaitForClose(time.Second * 60); err == nil {
-				closeChan <- struct{}{}
-				return
-			}
-		}
-	}()
-
-	return poolt1, poolt2, closeChan, nil
+type stoppableStreams interface {
+	Stop(timeout time.Duration) error
 }
 
 func main() {
-	// Bootstrap by reading cmd flags and configuration file
+	// Bootstrap by reading cmd flags and configuration file.
 	config := bootstrap()
 
-	// Logging and stats aggregation
+	// Logging and stats aggregation.
 	var logger log.Modular
 
-	// Note: Only log to Stderr if one of our outputs is stdout
+	// Note: Only log to Stderr if one of our outputs is stdout.
 	if config.Output.Type == "stdout" {
-		logger = log.NewLogger(os.Stderr, config.Logger)
+		logger = log.New(os.Stderr, config.Logger)
 	} else {
-		logger = log.NewLogger(os.Stdout, config.Logger)
+		logger = log.New(os.Stdout, config.Logger)
 	}
 
-	logger.Infoln("Launching a benthos instance, use CTRL+C to close.")
-
-	// Create our metrics type
-	stats, err := metrics.New(config.Metrics)
-	if err != nil {
-		logger.Errorf("Metrics error: %v\n", err)
-		return
+	// Create our metrics type.
+	var stats metrics.Type
+	var err error
+	stats, err = metrics.New(config.Metrics, metrics.OptSetLogger(logger))
+	for err != nil {
+		logger.Errorf("Failed to connect to metrics aggregator: %v\n", err)
+		<-time.After(time.Second)
+		stats, err = metrics.New(config.Metrics, metrics.OptSetLogger(logger))
 	}
 	defer stats.Close()
 
-	registerHTTPEndpoints(config, logger, stats)
-
-	poolTiered, poolNonTiered, outputsClosedChan, err := createPipeline(config, logger, stats)
+	// Create HTTP API with a sanitised service config.
+	sanConf, err := config.Sanitised()
 	if err != nil {
-		logger.Errorf("Service closing due to: %v\n", err)
-		return
+		logger.Warnf("Failed to generate sanitised config: %v\n", err)
+	}
+	httpServer := api.New(Version, DateBuilt, config.HTTP, sanConf, logger, stats)
+
+	// Create resource manager.
+	manager, err := manager.New(config.Manager, httpServer, logger, stats)
+	if err != nil {
+		logger.Errorf("Failed to create resource: %v\n", err)
+		os.Exit(1)
 	}
 
-	httpServerClosedChan := make(chan struct{})
-	httpServer := &http.Server{
-		Addr:        config.HTTP.Address,
-		Handler:     http.DefaultServeMux,
-		ReadTimeout: time.Millisecond * time.Duration(config.HTTP.ReadTimeoutMS),
+	var dataStream stoppableStreams
+	dataStreamClosedChan := make(chan struct{})
+
+	// Create data streams.
+	if *streamsMode {
+		streamMgr := strmmgr.New(
+			strmmgr.OptSetAPITimeout(time.Duration(config.HTTP.ReadTimeoutMS)*time.Millisecond),
+			strmmgr.OptSetLogger(logger),
+			strmmgr.OptSetManager(manager),
+			strmmgr.OptSetStats(stats),
+		)
+		var streamConfs map[string]stream.Config
+		if streamConfs, err = strmmgr.LoadStreamConfigsFromDirectory(true, *streamsDir); err != nil {
+			logger.Errorf("Failed to load stream configs: %v\n", err)
+			os.Exit(1)
+		}
+		dataStream = streamMgr
+		for id, conf := range streamConfs {
+			if err = streamMgr.Create(id, conf); err != nil {
+				logger.Errorf("Failed to create stream (%v): %v\n", id, err)
+				os.Exit(1)
+			}
+		}
+		logger.Infoln("Launching benthos in streams mode, use CTRL+C to close.")
+		if lStreams := len(streamConfs); lStreams > 0 {
+			logger.Infof("Created %v streams from directory: %v\n", lStreams, *streamsDir)
+		}
+	} else {
+		if dataStream, err = stream.New(
+			config.Config,
+			stream.OptSetLogger(logger),
+			stream.OptSetStats(stats),
+			stream.OptSetManager(manager),
+			stream.OptOnClose(func() {
+				close(dataStreamClosedChan)
+			}),
+		); err != nil {
+			logger.Errorf("Service closing due to: %v\n", err)
+			os.Exit(1)
+		}
+		logger.Infoln("Launching a benthos instance, use CTRL+C to close.")
 	}
+
+	// Start HTTP server.
+	httpServerClosedChan := make(chan struct{})
 	go func() {
 		logger.Infof(
 			"Listening for HTTP requests at: %v\n",
@@ -254,12 +479,12 @@ func main() {
 		)
 		httpErr := httpServer.ListenAndServe()
 		if httpErr != nil && httpErr != http.ErrServerClosed {
-			logger.Errorf("HTTP Server error: %v\n", err)
+			logger.Errorf("HTTP Server error: %v\n", httpErr)
 		}
 		close(httpServerClosedChan)
 	}()
 
-	// Defer ordered pool clean up.
+	// Defer clean up.
 	defer func() {
 		tout := time.Millisecond * time.Duration(config.SystemCloseTimeoutMS)
 
@@ -272,20 +497,18 @@ func main() {
 			}
 		}()
 
-		if err := poolTiered.Close(tout / 2); err != nil {
+		go func() {
+			<-time.After(tout + time.Second)
 			logger.Warnln(
-				"Service failed to close using ordered tiers, you may receive a duplicate " +
-					"message on the next service start.",
+				"Service failed to close cleanly within allocated time." +
+					" Exiting forcefully and dumping stack trace to stderr.",
 			)
-			if err = poolNonTiered.Close(tout / 2); err != nil {
-				logger.Warnln(
-					"Service failed to close cleanly within allocated time. Exiting forcefully.",
-				)
-				if config.Logger.LogLevel == "DEBUG" {
-					pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
-				}
-				os.Exit(1)
-			}
+			pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
+			os.Exit(1)
+		}()
+
+		if err := dataStream.Stop(tout); err != nil {
+			os.Exit(1)
 		}
 	}()
 
@@ -296,8 +519,10 @@ func main() {
 	select {
 	case <-sigChan:
 		logger.Infoln("Received SIGTERM, the service is closing.")
-	case <-outputsClosedChan:
+	case <-dataStreamClosedChan:
 		logger.Infoln("Pipeline has terminated. Shutting down the service.")
+	case <-httpServerClosedChan:
+		logger.Infoln("HTTP Server has terminated. Shutting down the service.")
 	}
 }
 

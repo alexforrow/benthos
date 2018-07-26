@@ -25,9 +25,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 func TestHashSample(t *testing.T) {
@@ -84,31 +84,79 @@ func TestHashSample(t *testing.T) {
 			conf.HashSample.RetainMax = tc.max
 			conf.HashSample.Parts = []int{0}
 
-			testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-			proc, err := NewHashSample(conf, testLog, metrics.DudType{})
+			testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+			proc, err := NewHashSample(conf, nil, testLog, metrics.DudType{})
 			if err != nil {
 				t.Error(err)
 				return
 			}
 
-			msgIn := types.Message{Parts: [][]byte{tc.input}}
-			msgOut, _, propagate := proc.ProcessMessage(&msgIn)
-			if propagate {
-				if &msgIn != msgOut {
-					t.Error("Message told to propagate but not given")
-				}
-			}
+			msgIn := types.NewMessage([][]byte{tc.input})
+			msgs, _ := proc.ProcessMessage(msgIn)
 
-			if nil != tc.expected && !propagate {
+			if nil != tc.expected && len(msgs) == 0 {
 				t.Error("Message told not to propagate even if it was expected to propagate")
 			}
-			if nil == tc.expected && propagate {
+			if nil == tc.expected && len(msgs) != 0 {
 				t.Error("Message told to propagate even if it was not expected to propagate")
 			}
-			if nil != tc.expected && propagate {
-				if !reflect.DeepEqual(msgOut.Parts[0], tc.expected) {
-					t.Errorf("Unexpected sampling: EXPECTED: %v, ACTUAL: %v", tc.expected, msgOut.Parts[0])
+			if nil != tc.expected && len(msgs) > 0 {
+				if !reflect.DeepEqual(msgs[0].GetAll()[0], tc.expected) {
+					t.Errorf("Unexpected sampling: EXPECTED: %v, ACTUAL: %v", tc.expected, msgs[0].GetAll()[0])
 				}
+			}
+		})
+	}
+}
+
+func TestHashSamplePartSelection(t *testing.T) {
+	doc1 := []byte(`some text`) // hashed to 44.82100
+
+	tt := []struct {
+		name       string
+		insertPart int
+		selectPart int
+	}{
+		{"index 0", 0, 0},
+		{"index 1", 1, 1},
+		{"index 2", 2, 2},
+		{"index 3", 3, 3},
+		{"index 4", 4, 4},
+		{"index -1", 4, -1},
+		{"index -2", 3, -2},
+		{"index -3", 2, -3},
+		{"index -4", 1, -4},
+		{"index -5", 0, -5},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := NewConfig()
+			conf.HashSample.RetainMin = 44.8
+			conf.HashSample.RetainMax = 44.9
+			conf.HashSample.Parts = []int{tc.selectPart}
+
+			testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+			proc, err := NewHashSample(conf, nil, testLog, metrics.DudType{})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+
+			parts := make([][]byte, 5)
+			for i := range parts {
+				parts[i] = []byte("FOO")
+			}
+			parts[tc.insertPart] = doc1
+
+			msgIn := types.NewMessage(parts)
+			msgs, _ := proc.ProcessMessage(msgIn)
+			if len(msgs) > 0 {
+				if !reflect.DeepEqual(msgIn, msgs[0]) {
+					t.Error("Message told to propagate but not given")
+				}
+			} else {
+				t.Error("Message told not to propagate")
 			}
 		})
 	}
@@ -118,20 +166,37 @@ func TestHashSampleBoundsCheck(t *testing.T) {
 	conf := NewConfig()
 	conf.HashSample.Parts = []int{5}
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewHashSample(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewHashSample(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	msgIn := types.Message{Parts: [][]byte{}}
-	msgOut, res, propagate := proc.ProcessMessage(&msgIn)
-	if propagate {
+	msgIn := types.NewMessage([][]byte{})
+	msgs, res := proc.ProcessMessage(msgIn)
+	if len(msgs) > 0 {
 		t.Error("OOB message told to propagate")
 	}
 
-	if msgOut != nil {
-		t.Error("Non-nil message returned")
+	if exp, act := types.NewSimpleResponse(nil), res; !reflect.DeepEqual(exp, act) {
+		t.Errorf("Wrong response returned: %v != %v", act, exp)
+	}
+}
+
+func TestHashSampleNegBoundsCheck(t *testing.T) {
+	conf := NewConfig()
+	conf.HashSample.Parts = []int{-5}
+
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewHashSample(conf, nil, testLog, metrics.DudType{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgIn := types.NewMessage([][]byte{})
+	msgs, res := proc.ProcessMessage(msgIn)
+	if len(msgs) > 0 {
+		t.Error("OOB message told to propagate")
 	}
 
 	if exp, act := types.NewSimpleResponse(nil), res; !reflect.DeepEqual(exp, act) {

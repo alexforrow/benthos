@@ -21,13 +21,15 @@
 package pipeline
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/processor"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/util/throttle"
 )
 
 //------------------------------------------------------------------------------
@@ -43,11 +45,10 @@ type Processor struct {
 
 	msgProcessors []processor.Type
 
-	messagesOut  chan types.Message
-	responsesOut chan types.Response
+	messagesOut chan types.Transaction
+	responsesIn chan types.Response
 
-	messagesIn  <-chan types.Message
-	responsesIn <-chan types.Response
+	messagesIn <-chan types.Transaction
 
 	closeChan chan struct{}
 	closed    chan struct{}
@@ -64,8 +65,8 @@ func NewProcessor(
 		msgProcessors: msgProcessors,
 		log:           log.NewModule(".pipeline.processor"),
 		stats:         stats,
-		messagesOut:   make(chan types.Message),
-		responsesOut:  make(chan types.Response),
+		messagesOut:   make(chan types.Transaction),
+		responsesIn:   make(chan types.Response),
 		closeChan:     make(chan struct{}),
 		closed:        make(chan struct{}),
 	}
@@ -78,56 +79,117 @@ func (p *Processor) loop() {
 	defer func() {
 		atomic.StoreInt32(&p.running, 0)
 
-		close(p.responsesOut)
 		close(p.messagesOut)
 		close(p.closed)
 	}()
 
+	var (
+		mProcCount   = p.stats.GetCounter("pipeline.processor.count")
+		mProcDropped = p.stats.GetCounter("pipeline.processor.dropped")
+		mSndSucc     = p.stats.GetCounter("pipeline.processor.send.success")
+		mSndErr      = p.stats.GetCounter("pipeline.processor.send.error")
+	)
+
+	throt := throttle.New(throttle.OptCloseChan(p.closeChan))
+
 	var open bool
 	for atomic.LoadInt32(&p.running) == 1 {
-		var msg types.Message
+		var tran types.Transaction
 		select {
-		case msg, open = <-p.messagesIn:
+		case tran, open = <-p.messagesIn:
 			if !open {
 				return
 			}
 		case <-p.closeChan:
 			return
 		}
-		p.stats.Incr("pipeline.processor.count", 1)
+		mProcCount.Incr(1)
 
-		resultMsg := &msg
+		resultMsgs := []types.Message{tran.Payload}
 		var resultRes types.Response
-		sending := true
-		for i := 0; sending && i < len(p.msgProcessors); i++ {
-			resultMsg, resultRes, sending = p.msgProcessors[i].ProcessMessage(resultMsg)
+		for i := 0; len(resultMsgs) > 0 && i < len(p.msgProcessors); i++ {
+			var nextResultMsgs []types.Message
+			for _, m := range resultMsgs {
+				var rMsgs []types.Message
+				rMsgs, resultRes = p.msgProcessors[i].ProcessMessage(m)
+				nextResultMsgs = append(nextResultMsgs, rMsgs...)
+			}
+			resultMsgs = nextResultMsgs
 		}
-		if !sending {
-			p.stats.Incr("pipeline.processor.dropped", 1)
+
+		if len(resultMsgs) == 0 {
+			mProcDropped.Incr(1)
 			select {
-			case p.responsesOut <- resultRes:
+			case tran.ResponseChan <- resultRes:
 			case <-p.closeChan:
 				return
 			}
 			continue
 		}
 
-		select {
-		case p.messagesOut <- *resultMsg:
-		case <-p.closeChan:
-			return
+		var skipAcks int64
+		sendMsg := func(m types.Message) {
+			resChan := make(chan types.Response)
+			transac := types.NewTransaction(m, resChan)
+
+			for {
+				select {
+				case p.messagesOut <- transac:
+				case <-p.closeChan:
+					return
+				}
+
+				var res types.Response
+				var open bool
+				select {
+				case res, open = <-resChan:
+					if !open {
+						return
+					}
+				case <-p.closeChan:
+					return
+				}
+
+				if skipAck := res.SkipAck(); res.Error() == nil || skipAck {
+					if skipAck {
+						atomic.AddInt64(&skipAcks, 1)
+					}
+					mSndSucc.Incr(1)
+					return
+				}
+				mSndErr.Incr(1)
+				if !throt.Retry() {
+					return
+				}
+			}
 		}
-		var res types.Response
-		if res, open = <-p.responsesIn; !open {
-			return
-		}
-		if res.Error() == nil {
-			p.stats.Incr("pipeline.processor.send.success", 1)
+
+		if len(resultMsgs) > 1 {
+			wg := sync.WaitGroup{}
+			wg.Add(len(resultMsgs))
+
+			for _, msg := range resultMsgs {
+				go func(m types.Message) {
+					defer wg.Done()
+					sendMsg(m)
+				}(msg)
+			}
+
+			wg.Wait()
 		} else {
-			p.stats.Incr("pipeline.processor.send.error", 1)
+			sendMsg(resultMsgs[0])
 		}
+		throt.Reset()
+
+		var res types.Response
+		if skipAcks == int64(len(resultMsgs)) {
+			res = types.NewUnacknowledgedResponse()
+		} else {
+			res = types.NewSimpleResponse(nil)
+		}
+
 		select {
-		case p.responsesOut <- res:
+		case tran.ResponseChan <- res:
 		case <-p.closeChan:
 			return
 		}
@@ -136,39 +198,20 @@ func (p *Processor) loop() {
 
 //------------------------------------------------------------------------------
 
-// StartReceiving assigns a messages channel for the pipeline to read.
-func (p *Processor) StartReceiving(msgs <-chan types.Message) error {
+// Consume assigns a messages channel for the pipeline to read.
+func (p *Processor) Consume(msgs <-chan types.Transaction) error {
 	if p.messagesIn != nil {
 		return types.ErrAlreadyStarted
 	}
 	p.messagesIn = msgs
-	if p.responsesIn != nil {
-		go p.loop()
-	}
+	go p.loop()
 	return nil
 }
 
-// MessageChan returns the channel used for consuming messages from this
+// TransactionChan returns the channel used for consuming messages from this
 // pipeline.
-func (p *Processor) MessageChan() <-chan types.Message {
+func (p *Processor) TransactionChan() <-chan types.Transaction {
 	return p.messagesOut
-}
-
-// StartListening sets the channel that this pipeline will read responses from.
-func (p *Processor) StartListening(responses <-chan types.Response) error {
-	if p.responsesIn != nil {
-		return types.ErrAlreadyStarted
-	}
-	p.responsesIn = responses
-	if p.messagesIn != nil {
-		go p.loop()
-	}
-	return nil
-}
-
-// ResponseChan returns the response channel from this pipeline.
-func (p *Processor) ResponseChan() <-chan types.Response {
-	return p.responsesOut
 }
 
 // CloseAsync shuts down the pipeline and stops processing messages.

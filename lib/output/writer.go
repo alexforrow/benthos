@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Ashley Jeffs
+// Copyright (c) 2018 Ashley Jeffs
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -21,52 +21,47 @@
 package output
 
 import (
-	"bytes"
-	"fmt"
-	"io"
 	"sync/atomic"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
+	"github.com/Jeffail/benthos/lib/output/writer"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 //------------------------------------------------------------------------------
 
-// writer is an output type that pushes messages to a io.WriterCloser type.
-type writer struct {
+// Writer is an output type that writes messages to a writer.Type.
+type Writer struct {
 	running int32
+
+	typeStr string
+	writer  writer.Type
 
 	log   log.Modular
 	stats metrics.Type
 
-	customDelim []byte
-
-	messages     <-chan types.Message
-	responseChan chan types.Response
-
-	handle io.WriteCloser
+	transactions <-chan types.Transaction
 
 	closeChan  chan struct{}
 	closedChan chan struct{}
 }
 
-// newWriter creates a new writer output type.
-func newWriter(
-	handle io.WriteCloser,
-	customDelimiter []byte,
+// NewWriter creates a new Writer output type.
+func NewWriter(
+	typeStr string,
+	w writer.Type,
 	log log.Modular,
 	stats metrics.Type,
 ) (Type, error) {
-	return &writer{
+	return &Writer{
 		running:      1,
-		log:          log.NewModule(".output.writer"),
+		typeStr:      typeStr,
+		writer:       w,
+		log:          log.NewModule(".output." + typeStr),
 		stats:        stats,
-		customDelim:  customDelimiter,
-		messages:     nil,
-		responseChan: make(chan types.Response),
-		handle:       handle,
+		transactions: nil,
 		closeChan:    make(chan struct{}),
 		closedChan:   make(chan struct{}),
 	}, nil
@@ -75,74 +70,144 @@ func newWriter(
 //------------------------------------------------------------------------------
 
 // loop is an internal loop that brokers incoming messages to output pipe.
-func (w *writer) loop() {
-	defer func() {
-		w.handle.Close()
+func (w *Writer) loop() {
+	// Metrics paths
+	var (
+		mRunning     = w.stats.GetCounter("output.running")
+		mRunningF    = w.stats.GetCounter("output." + w.typeStr + ".running")
+		mCount       = w.stats.GetCounter("output.count")
+		mCountF      = w.stats.GetCounter("output." + w.typeStr + ".count")
+		mSuccess     = w.stats.GetCounter("output.send.success")
+		mSuccessF    = w.stats.GetCounter("output." + w.typeStr + ".send.success")
+		mError       = w.stats.GetCounter("output.send.error")
+		mErrorF      = w.stats.GetCounter("output." + w.typeStr + ".send.error")
+		mConn        = w.stats.GetCounter("output.connection.up")
+		mConnF       = w.stats.GetCounter("output." + w.typeStr + ".connection.up")
+		mFailedConn  = w.stats.GetCounter("output.connection.failed")
+		mFailedConnF = w.stats.GetCounter("output." + w.typeStr + ".connection.failed")
+		mLostConn    = w.stats.GetCounter("output.connection.lost")
+		mLostConnF   = w.stats.GetCounter("output." + w.typeStr + ".connection.lost")
+	)
 
-		close(w.responseChan)
+	defer func() {
+		err := w.writer.WaitForClose(time.Second)
+		for ; err != nil; err = w.writer.WaitForClose(time.Second) {
+		}
+		mRunning.Decr(1)
+		mRunningF.Decr(1)
 		close(w.closedChan)
 	}()
+	mRunning.Incr(1)
+	mRunningF.Incr(1)
 
-	delim := []byte("\n")
-	if len(w.customDelim) > 0 {
-		delim = w.customDelim
+	for {
+		if err := w.writer.Connect(); err != nil {
+			// Close immediately if our writer is closed.
+			if err == types.ErrTypeClosed {
+				return
+			}
+
+			w.log.Errorf("Failed to connect to %v: %v\n", w.typeStr, err)
+			mFailedConn.Incr(1)
+			mFailedConnF.Incr(1)
+			select {
+			case <-time.After(time.Second):
+			case <-w.closeChan:
+				return
+			}
+		} else {
+			break
+		}
 	}
+	mConn.Incr(1)
+	mConnF.Incr(1)
 
 	for atomic.LoadInt32(&w.running) == 1 {
-		var msg types.Message
+		var ts types.Transaction
 		var open bool
 		select {
-		case msg, open = <-w.messages:
+		case ts, open = <-w.transactions:
 			if !open {
 				return
 			}
-			w.stats.Incr("output.writer.count", 1)
+			mCount.Incr(1)
+			mCountF.Incr(1)
 		case <-w.closeChan:
 			return
 		}
-		var err error
-		if len(msg.Parts) == 1 {
-			_, err = fmt.Fprintf(w.handle, "%s%s", msg.Parts[0], delim)
-		} else {
-			_, err = fmt.Fprintf(w.handle, "%s%s%s", bytes.Join(msg.Parts, delim), delim, delim)
+
+		err := w.writer.Write(ts.Payload)
+
+		// If our writer says it is not connected.
+		if err == types.ErrNotConnected {
+			mLostConn.Incr(1)
+			mLostConnF.Incr(1)
+
+			// Continue to try to reconnect while still active.
+			for atomic.LoadInt32(&w.running) == 1 {
+				if err = w.writer.Connect(); err != nil {
+					// Close immediately if our writer is closed.
+					if err == types.ErrTypeClosed {
+						return
+					}
+
+					w.log.Errorf("Failed to reconnect to %v: %v\n", w.typeStr, err)
+					mFailedConn.Incr(1)
+					mFailedConnF.Incr(1)
+					select {
+					case <-time.After(time.Second):
+					case <-w.closeChan:
+						return
+					}
+				} else if err = w.writer.Write(ts.Payload); err != types.ErrNotConnected {
+					mConn.Incr(1)
+					mConnF.Incr(1)
+					break
+				}
+			}
 		}
+
+		// Close immediately if our writer is closed.
+		if err == types.ErrTypeClosed {
+			return
+		}
+
 		if err != nil {
-			w.stats.Incr("output.writer.send.error", 1)
+			w.log.Errorf("Failed to send message to %v: %v\n", w.typeStr, err)
+			mError.Incr(1)
+			mErrorF.Incr(1)
 		} else {
-			w.stats.Incr("output.writer.send.success", 1)
+			mSuccess.Incr(1)
+			mSuccessF.Incr(1)
 		}
 		select {
-		case w.responseChan <- types.NewSimpleResponse(err):
+		case ts.ResponseChan <- types.NewSimpleResponse(err):
 		case <-w.closeChan:
 			return
 		}
 	}
 }
 
-// StartReceiving assigns a messages channel for the output to read.
-func (w *writer) StartReceiving(msgs <-chan types.Message) error {
-	if w.messages != nil {
+// Consume assigns a messages channel for the output to read.
+func (w *Writer) Consume(ts <-chan types.Transaction) error {
+	if w.transactions != nil {
 		return types.ErrAlreadyStarted
 	}
-	w.messages = msgs
+	w.transactions = ts
 	go w.loop()
 	return nil
 }
 
-// ResponseChan returns the errors channel.
-func (w *writer) ResponseChan() <-chan types.Response {
-	return w.responseChan
-}
-
 // CloseAsync shuts down the File output and stops processing messages.
-func (w *writer) CloseAsync() {
+func (w *Writer) CloseAsync() {
 	if atomic.CompareAndSwapInt32(&w.running, 1, 0) {
+		w.writer.CloseAsync()
 		close(w.closeChan)
 	}
 }
 
 // WaitForClose blocks until the File output has closed down.
-func (w *writer) WaitForClose(timeout time.Duration) error {
+func (w *Writer) WaitForClose(timeout time.Duration) error {
 	select {
 	case <-w.closedChan:
 	case <-time.After(timeout):

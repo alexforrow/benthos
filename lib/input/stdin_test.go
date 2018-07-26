@@ -25,24 +25,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 )
 
 func TestSTDINClose(t *testing.T) {
-	s, err := NewSTDIN(NewConfig(), log.NewLogger(os.Stdout, logConfig), metrics.DudType{})
+	s, err := NewSTDIN(NewConfig(), nil, log.New(os.Stdout, logConfig), metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
-	}
-
-	c := make(chan types.Response)
-	if err := s.StartListening(c); err != nil {
-		t.Error(err)
-	}
-	if err := s.StartListening(c); err == nil {
-		t.Error("Expected error from second listener")
 	}
 
 	s.CloseAsync()

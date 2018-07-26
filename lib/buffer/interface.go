@@ -28,8 +28,8 @@ type Type interface {
 	types.Consumer
 	types.Closable
 
-	// ErrorsChan returns the channel used for returning any accumulated errors.
-	// This needs reading in the same select block where messages are sent as
-	// the errors can occur at any time.
-	ErrorsChan() <-chan []error
+	// StopConsuming instructs the buffer to cut off the input. It will then
+	// enter a mode whereby messages can only be read, and when the buffer is
+	// empty it will shut down.
+	StopConsuming()
 }

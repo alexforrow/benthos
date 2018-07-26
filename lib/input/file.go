@@ -21,25 +21,26 @@
 package input
 
 import (
-	"bufio"
+	"io"
 	"os"
 
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/input/reader"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
+	"github.com/Jeffail/benthos/lib/types"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["file"] = typeSpec{
+	Constructors["file"] = TypeSpec{
 		constructor: NewFile,
 		description: `
 The file type reads input from a file. If multipart is set to false each line
 is read as a separate message. If multipart is set to true each line is read as
 a message part, and an empty line indicates the end of a message.
 
-Alternatively, a custom delimiter can be set that is used instead of line
-breaks.`,
+If the delimiter field is left empty then line feed (\n) is used.`,
 	}
 }
 
@@ -47,39 +48,57 @@ breaks.`,
 
 // FileConfig is configuration values for the File input type.
 type FileConfig struct {
-	Path        string `json:"path" yaml:"path"`
-	Multipart   bool   `json:"multipart" yaml:"multipart"`
-	MaxBuffer   int    `json:"max_buffer" yaml:"max_buffer"`
-	CustomDelim string `json:"custom_delimiter" yaml:"custom_delimiter"`
+	Path      string `json:"path" yaml:"path"`
+	Multipart bool   `json:"multipart" yaml:"multipart"`
+	MaxBuffer int    `json:"max_buffer" yaml:"max_buffer"`
+	Delim     string `json:"delimiter" yaml:"delimiter"`
 }
 
 // NewFileConfig creates a new FileConfig with default values.
 func NewFileConfig() FileConfig {
 	return FileConfig{
-		Path:        "",
-		Multipart:   false,
-		MaxBuffer:   bufio.MaxScanTokenSize,
-		CustomDelim: "",
+		Path:      "",
+		Multipart: false,
+		MaxBuffer: 1000000,
+		Delim:     "",
 	}
 }
 
 //------------------------------------------------------------------------------
 
 // NewFile creates a new File input type.
-func NewFile(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewFile(conf Config, mgr types.Manager, log log.Modular, stats metrics.Type) (Type, error) {
 	file, err := os.Open(conf.File.Path)
 	if err != nil {
 		return nil, err
 	}
-	delim := []byte("\n")
-	if len(conf.File.CustomDelim) > 0 {
-		delim = []byte(conf.File.CustomDelim)
+	delim := conf.File.Delim
+	if len(delim) == 0 {
+		delim = "\n"
 	}
-	return newReader(
-		file,
-		conf.File.MaxBuffer,
-		conf.File.Multipart,
-		delim,
+
+	rdr, err := reader.NewLines(
+		func() (io.Reader, error) {
+			// Swap so this only works once since we don't want to read the file
+			// multiple times.
+			if file == nil {
+				return nil, io.EOF
+			}
+			sendFile := file
+			file = nil
+			return sendFile, nil
+		},
+		func() {},
+		reader.OptLinesSetDelimiter(delim),
+		reader.OptLinesSetMaxBuffer(conf.File.MaxBuffer),
+		reader.OptLinesSetMultipart(conf.File.Multipart),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return NewReader(
+		"file",
+		reader.NewPreserver(rdr),
 		log, stats,
 	)
 }

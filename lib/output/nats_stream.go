@@ -27,16 +27,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 	"github.com/nats-io/go-nats-streaming"
 )
 
 //------------------------------------------------------------------------------
 
 func init() {
-	constructors["nats_stream"] = typeSpec{
+	Constructors["nats_stream"] = TypeSpec{
 		constructor: NewNATSStream,
 		description: `
 Publish to a NATS Stream subject. NATS Streaming is at-least-once and therefore
@@ -58,7 +58,7 @@ type NATSStreamConfig struct {
 func NewNATSStreamConfig() NATSStreamConfig {
 	return NATSStreamConfig{
 		URLs:      []string{stan.DefaultNatsURL},
-		ClusterID: "benthos_cluster",
+		ClusterID: "test-cluster",
 		ClientID:  "benthos_client",
 		Subject:   "benthos_messages",
 	}
@@ -78,15 +78,14 @@ type NATSStream struct {
 	urls string
 	conf Config
 
-	messages     <-chan types.Message
-	responseChan chan types.Response
+	transactions <-chan types.Transaction
 
 	closedChan chan struct{}
 	closeChan  chan struct{}
 }
 
 // NewNATSStream creates a new NATSStream output type.
-func NewNATSStream(conf Config, log log.Modular, stats metrics.Type) (Type, error) {
+func NewNATSStream(conf Config, mgr types.Manager, log log.Modular, stats metrics.Type) (Type, error) {
 	if len(conf.NATSStream.ClientID) == 0 {
 		rgen := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -97,14 +96,12 @@ func NewNATSStream(conf Config, log log.Modular, stats metrics.Type) (Type, erro
 	}
 
 	n := NATSStream{
-		running:      1,
-		log:          log.NewModule(".output.nats_stream"),
-		stats:        stats,
-		conf:         conf,
-		messages:     nil,
-		responseChan: make(chan types.Response),
-		closedChan:   make(chan struct{}),
-		closeChan:    make(chan struct{}),
+		running:    1,
+		log:        log.NewModule(".output.nats_stream"),
+		stats:      stats,
+		conf:       conf,
+		closedChan: make(chan struct{}),
+		closeChan:  make(chan struct{}),
 	}
 	n.urls = strings.Join(conf.NATSStream.URLs, ",")
 
@@ -125,14 +122,25 @@ func (n *NATSStream) connect() error {
 
 // loop is an internal loop that brokers incoming messages to output pipe.
 func (n *NATSStream) loop() {
+	var (
+		mRunning = n.stats.GetCounter("output.nats_stream.running")
+		mCount   = n.stats.GetCounter("output.nats_stream.count")
+		mErr     = n.stats.GetCounter("output.nats_stream.send.error")
+		mSucc    = n.stats.GetCounter("output.nats_stream.send.success")
+	)
+
 	defer func() {
 		atomic.StoreInt32(&n.running, 0)
 
-		n.natsConn.Close()
+		if n.natsConn != nil {
+			n.natsConn.Close()
+			n.natsConn = nil
+		}
+		mRunning.Decr(1)
 
-		close(n.responseChan)
 		close(n.closedChan)
 	}()
+	mRunning.Incr(1)
 
 	for {
 		if err := n.connect(); err != nil {
@@ -150,47 +158,42 @@ func (n *NATSStream) loop() {
 
 	var open bool
 	for atomic.LoadInt32(&n.running) == 1 {
-		var msg types.Message
+		var ts types.Transaction
 		select {
-		case msg, open = <-n.messages:
+		case ts, open = <-n.transactions:
 			if !open {
 				return
 			}
 		case <-n.closeChan:
 			return
 		}
-		n.stats.Incr("output.nats_stream.count", 1)
+		mCount.Incr(1)
 		var err error
-		for _, part := range msg.Parts {
+		for _, part := range ts.Payload.GetAll() {
 			err = n.natsConn.Publish(n.conf.NATSStream.Subject, part)
 			if err != nil {
-				n.stats.Incr("output.nats_stream.send.error", 1)
+				mErr.Incr(1)
 				break
 			} else {
-				n.stats.Incr("output.nats_stream.send.success", 1)
+				mSucc.Incr(1)
 			}
 		}
 		select {
-		case n.responseChan <- types.NewSimpleResponse(err):
+		case ts.ResponseChan <- types.NewSimpleResponse(err):
 		case <-n.closeChan:
 			return
 		}
 	}
 }
 
-// StartReceiving assigns a messages channel for the output to read.
-func (n *NATSStream) StartReceiving(msgs <-chan types.Message) error {
-	if n.messages != nil {
+// Consume assigns a messages channel for the output to read.
+func (n *NATSStream) Consume(ts <-chan types.Transaction) error {
+	if n.transactions != nil {
 		return types.ErrAlreadyStarted
 	}
-	n.messages = msgs
+	n.transactions = ts
 	go n.loop()
 	return nil
-}
-
-// ResponseChan returns the errors channel.
-func (n *NATSStream) ResponseChan() <-chan types.Response {
-	return n.responseChan
 }
 
 // CloseAsync shuts down the NATSStream output and stops processing messages.

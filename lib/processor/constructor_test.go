@@ -25,8 +25,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -40,10 +40,10 @@ func TestConstructorBadType(t *testing.T) {
 	conf := NewConfig()
 	conf.Type = "not_exist"
 
-	logConfig := log.NewLoggerConfig()
+	logConfig := log.NewConfig()
 	logConfig.LogLevel = "NONE"
 
-	if _, err := New(conf, log.NewLogger(os.Stdout, logConfig), metrics.DudType{}); err == nil {
+	if _, err := New(conf, nil, log.New(os.Stdout, logConfig), metrics.DudType{}); err == nil {
 		t.Error("Expected error, received nil for invalid type")
 	}
 }
@@ -97,5 +97,54 @@ func TestConstructorConfigDefaultsYAML(t *testing.T) {
 	}
 	if exp, act := 50, conf[0].BoundsCheck.MaxPartSize; exp != act {
 		t.Errorf("Wrong overridden part size: %v != %v", act, exp)
+	}
+}
+
+func TestSanitise(t *testing.T) {
+	var actObj interface{}
+	var act []byte
+	var err error
+
+	exp := `{` +
+		`"type":"combine",` +
+		`"combine":{` +
+		`"parts":3` +
+		`}` +
+		`}`
+
+	conf := NewConfig()
+	conf.Type = "combine"
+	conf.Combine.Parts = 3
+
+	if actObj, err = SanitiseConfig(conf); err != nil {
+		t.Fatal(err)
+	}
+	if act, err = json.Marshal(actObj); err != nil {
+		t.Fatal(err)
+	}
+	if string(act) != exp {
+		t.Errorf("Wrong sanitised output: %s != %v", act, exp)
+	}
+
+	exp = `{` +
+		`"type":"archive",` +
+		`"archive":{` +
+		`"format":"binary",` +
+		`"path":"nope"` +
+		`}` +
+		`}`
+
+	conf = NewConfig()
+	conf.Type = "archive"
+	conf.Archive.Path = "nope"
+
+	if actObj, err = SanitiseConfig(conf); err != nil {
+		t.Fatal(err)
+	}
+	if act, err = json.Marshal(actObj); err != nil {
+		t.Fatal(err)
+	}
+	if string(act) != exp {
+		t.Errorf("Wrong sanitised output: %s != %v", act, exp)
 	}
 }

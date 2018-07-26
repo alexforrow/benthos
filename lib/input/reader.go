@@ -1,4 +1,4 @@
-// Copyright (c) 2014 Ashley Jeffs
+// Copyright (c) 2018 Ashley Jeffs
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -21,214 +21,225 @@
 package input
 
 import (
-	"bufio"
-	"bytes"
-	"io"
 	"sync/atomic"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/input/reader"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 //------------------------------------------------------------------------------
 
-// reader is an input type that reads messages from an io.Reader type.
-type reader struct {
+// Reader is an input type that reads from a Reader instance.
+type Reader struct {
 	running int32
 
-	handle io.Reader
+	typeStr string
+	reader  reader.Type
 
-	maxBuffer   int
-	multipart   bool
-	customDelim []byte
-
-	log   log.Modular
 	stats metrics.Type
+	log   log.Modular
 
-	internalMessages chan [][]byte
-
-	messages  chan types.Message
-	responses <-chan types.Response
+	transactions chan types.Transaction
+	responses    chan types.Response
 
 	closeChan  chan struct{}
 	closedChan chan struct{}
 }
 
-// newReader creates a new reader input type.
-func newReader(
-	handle io.Reader,
-	maxBuffer int,
-	multipart bool,
-	customDelim []byte,
+// NewReader creates a new Reader input type.
+func NewReader(
+	typeStr string,
+	r reader.Type,
 	log log.Modular,
 	stats metrics.Type,
 ) (Type, error) {
-	s := reader{
-		running:          1,
-		handle:           handle,
-		maxBuffer:        maxBuffer,
-		multipart:        multipart,
-		customDelim:      customDelim,
-		log:              log.NewModule(".input.reader"),
-		stats:            stats,
-		internalMessages: make(chan [][]byte),
-		messages:         make(chan types.Message),
-		responses:        nil,
-		closeChan:        make(chan struct{}),
-		closedChan:       make(chan struct{}),
+	rdr := &Reader{
+		running:      1,
+		typeStr:      typeStr,
+		reader:       r,
+		log:          log.NewModule(".input." + typeStr),
+		stats:        stats,
+		transactions: make(chan types.Transaction),
+		responses:    make(chan types.Response),
+		closeChan:    make(chan struct{}),
+		closedChan:   make(chan struct{}),
 	}
 
-	return &s, nil
+	go rdr.loop()
+	return rdr, nil
 }
 
 //------------------------------------------------------------------------------
 
-// readLoop reads from input pipe and sends to internal messages chan.
-func (s *reader) readLoop() {
+func (r *Reader) loop() {
+	// Metrics paths
+	var (
+		mRunning      = r.stats.GetCounter("input." + r.typeStr + ".running")
+		mRunningF     = r.stats.GetCounter("input.running")
+		mCount        = r.stats.GetCounter("input." + r.typeStr + ".count")
+		mCountF       = r.stats.GetCounter("input.count")
+		mReadSuccess  = r.stats.GetCounter("input." + r.typeStr + ".read.success")
+		mReadSuccessF = r.stats.GetCounter("input.read.success")
+		mReadError    = r.stats.GetCounter("input." + r.typeStr + ".read.error")
+		mReadErrorF   = r.stats.GetCounter("input.read.error")
+		mSendSuccess  = r.stats.GetCounter("input." + r.typeStr + ".send.success")
+		mSendSuccessF = r.stats.GetCounter("input.send.success")
+		mSendError    = r.stats.GetCounter("input." + r.typeStr + ".send.error")
+		mSendErrorF   = r.stats.GetCounter("input.send.error")
+		mAckSuccess   = r.stats.GetCounter("input." + r.typeStr + ".ack.success")
+		mAckSuccessF  = r.stats.GetCounter("input.ack.success")
+		mAckError     = r.stats.GetCounter("input." + r.typeStr + ".ack.error")
+		mAckErrorF    = r.stats.GetCounter("input.ack.error")
+		mConn         = r.stats.GetCounter("input." + r.typeStr + ".connection.up")
+		mConnF        = r.stats.GetCounter("input.connection.up")
+		mFailedConn   = r.stats.GetCounter("input." + r.typeStr + ".connection.failed")
+		mFailedConnF  = r.stats.GetCounter("input.connection.failed")
+		mLostConn     = r.stats.GetCounter("input." + r.typeStr + ".connection.lost")
+		mLostConnF    = r.stats.GetCounter("input.connection.lost")
+		mLatency      = r.stats.GetTimer("input." + r.typeStr + ".latency")
+		mLatencyF     = r.stats.GetTimer("input.latency")
+	)
+
 	defer func() {
-		close(s.internalMessages)
-		if closer, ok := s.handle.(io.ReadCloser); ok {
-			closer.Close()
+		err := r.reader.WaitForClose(time.Second)
+		for ; err != nil; err = r.reader.WaitForClose(time.Second) {
 		}
+		mRunning.Decr(1)
+		mRunningF.Decr(1)
+
+		close(r.transactions)
+		close(r.closedChan)
 	}()
-	scanner := bufio.NewScanner(s.handle)
-	if s.maxBuffer != bufio.MaxScanTokenSize {
-		scanner.Buffer([]byte{}, s.maxBuffer)
-	}
-	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
-		if atEOF && len(data) == 0 {
-			return 0, nil, nil
-		}
+	mRunning.Incr(1)
+	mRunningF.Incr(1)
 
-		if i := bytes.Index(data, s.customDelim); i >= 0 {
-			// We have a full terminated line.
-			return i + len(s.customDelim), data[0:i], nil
-		}
-
-		// If we're at EOF, we have a final, non-terminated line. Return it.
-		if atEOF {
-			return len(data), data, nil
-		}
-
-		// Request more data.
-		return 0, nil, nil
-	})
-
-	var partsToSend, parts [][]byte
-
-	for atomic.LoadInt32(&s.running) == 1 {
-		// If no bytes then read a line
-		if len(partsToSend) == 0 {
-			if scanner.Scan() {
-				newPart := make([]byte, len(scanner.Bytes()))
-				copy(newPart, scanner.Bytes())
-				if len(newPart) > 0 {
-					if s.multipart {
-						parts = append(parts, newPart)
-					} else {
-						partsToSend = append(partsToSend, newPart)
-					}
-				} else if s.multipart {
-					// Empty line means we're finished reading parts for this
-					// message.
-					partsToSend = parts
-					parts = nil
-				}
-			} else {
-				if err := scanner.Err(); err != nil {
-					s.log.Errorf("Failed to read input: %v\n", err)
-				}
+	for {
+		if err := r.reader.Connect(); err != nil {
+			if err == types.ErrTypeClosed {
 				return
 			}
-		}
-
-		// If we have a line to push out
-		if len(partsToSend) != 0 {
+			r.log.Errorf("Failed to connect to %v: %v\n", r.typeStr, err)
+			mFailedConn.Incr(1)
+			mFailedConnF.Incr(1)
 			select {
-			case s.internalMessages <- partsToSend:
-				partsToSend = nil
 			case <-time.After(time.Second):
+			case <-r.closeChan:
+				return
 			}
+		} else {
+			break
 		}
 	}
-}
+	mConn.Incr(1)
+	mConnF.Incr(1)
 
-// loop is the internal loop that brokers incoming messages to output pipe.
-func (s *reader) loop() {
-	defer func() {
-		atomic.StoreInt32(&s.running, 0)
-		close(s.messages)
-		close(s.closedChan)
-	}()
+	for atomic.LoadInt32(&r.running) == 1 {
+		msg, err := r.reader.Read()
 
-	var data [][]byte
-	var open bool
+		// If our reader says it is not connected.
+		if err == types.ErrNotConnected {
+			mLostConn.Incr(1)
+			mLostConnF.Incr(1)
 
-	readChan := s.internalMessages
+			// Continue to try to reconnect while still active.
+			for atomic.LoadInt32(&r.running) == 1 {
+				if err = r.reader.Connect(); err != nil {
+					// Close immediately if our reader is closed.
+					if err == types.ErrTypeClosed {
+						return
+					}
 
-	for atomic.LoadInt32(&s.running) == 1 {
-		if data == nil {
-			select {
-			case data, open = <-readChan:
-				if !open {
-					return
+					r.log.Errorf("Failed to reconnect to %v: %v\n", r.typeStr, err)
+					mFailedConn.Incr(1)
+					mFailedConnF.Incr(1)
+					select {
+					case <-time.After(time.Second):
+					case <-r.closeChan:
+						return
+					}
+				} else if msg, err = r.reader.Read(); err != types.ErrNotConnected {
+					mConn.Incr(1)
+					mConnF.Incr(1)
+					break
 				}
-				s.stats.Incr("input.reader.count", 1)
-			case <-s.closeChan:
-				return
 			}
 		}
-		if data != nil {
-			select {
-			case s.messages <- types.Message{Parts: data}:
-			case <-s.closeChan:
-				return
-			}
 
-			var res types.Response
-			if res, open = <-s.responses; !open {
+		// Close immediately if our reader is closed.
+		if err == types.ErrTypeClosed {
+			return
+		}
+
+		if err != nil || msg == nil {
+			if err != types.ErrTimeout && err != types.ErrNotConnected {
+				mReadError.Incr(1)
+				mReadErrorF.Incr(1)
+				r.log.Errorf("Failed to read message: %v\n", err)
+			}
+			continue
+		} else {
+			mCount.Incr(1)
+			mCountF.Incr(1)
+			mReadSuccess.Incr(1)
+			mReadSuccessF.Incr(1)
+		}
+
+		select {
+		case r.transactions <- types.NewTransaction(msg, r.responses):
+		case <-r.closeChan:
+			return
+		}
+
+		select {
+		case res, open := <-r.responses:
+			if !open {
 				return
 			}
-			if res.Error() == nil {
-				s.stats.Incr("input.reader.send.success", 1)
-				data = nil
+			if res.Error() != nil {
+				mSendError.Incr(1)
+				mSendErrorF.Incr(1)
 			} else {
-				s.stats.Incr("input.reader.send.error", 1)
+				mSendSuccess.Incr(1)
+				mSendSuccessF.Incr(1)
 			}
+			if res.Error() != nil || !res.SkipAck() {
+				if err = r.reader.Acknowledge(res.Error()); err != nil {
+					mAckError.Incr(1)
+					mAckErrorF.Incr(1)
+				} else {
+					tTaken := time.Since(msg.CreatedAt()).Nanoseconds()
+					mLatency.Timing(tTaken)
+					mLatencyF.Timing(tTaken)
+					mAckSuccess.Incr(1)
+					mAckSuccessF.Incr(1)
+				}
+			}
+		case <-r.closeChan:
+			return
 		}
 	}
 }
 
-// StartListening sets the channel used by the input to validate message
-// receipt.
-func (s *reader) StartListening(responses <-chan types.Response) error {
-	if s.responses != nil {
-		return types.ErrAlreadyStarted
-	}
-	s.responses = responses
-	go s.readLoop()
-	go s.loop()
-	return nil
+// TransactionChan returns the transactions channel.
+func (r *Reader) TransactionChan() <-chan types.Transaction {
+	return r.transactions
 }
 
-// MessageChan returns the messages channel.
-func (s *reader) MessageChan() <-chan types.Message {
-	return s.messages
-}
-
-// CloseAsync shuts down the reader input and stops processing requests.
-func (s *reader) CloseAsync() {
-	if atomic.CompareAndSwapInt32(&s.running, 1, 0) {
-		close(s.closeChan)
+// CloseAsync shuts down the Reader input and stops processing requests.
+func (r *Reader) CloseAsync() {
+	if atomic.CompareAndSwapInt32(&r.running, 1, 0) {
+		r.reader.CloseAsync()
+		close(r.closeChan)
 	}
 }
 
-// WaitForClose blocks until the reader input has closed down.
-func (s *reader) WaitForClose(timeout time.Duration) error {
+// WaitForClose blocks until the Reader input has closed down.
+func (r *Reader) WaitForClose(timeout time.Duration) error {
 	select {
-	case <-s.closedChan:
+	case <-r.closedChan:
 	case <-time.After(timeout):
 		return types.ErrTimeout
 	}

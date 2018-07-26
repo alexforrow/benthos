@@ -25,17 +25,17 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 func TestSelectParts(t *testing.T) {
 	conf := NewConfig()
 	conf.SelectParts.Parts = []int{1, 3}
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewSelectParts(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewSelectParts(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
@@ -86,14 +86,60 @@ func TestSelectParts(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		msg, res, check := proc.ProcessMessage(&types.Message{Parts: test.in})
-		if !check {
+		msgs, res := proc.ProcessMessage(types.NewMessage(test.in))
+		if len(msgs) != 1 {
 			t.Errorf("Select Parts failed on: %s", test.in)
 		} else if res != nil {
 			t.Errorf("Expected nil response: %v", res)
 		}
-		if exp, act := test.out, msg.Parts; !reflect.DeepEqual(exp, act) {
+		if exp, act := test.out, msgs[0].GetAll(); !reflect.DeepEqual(exp, act) {
 			t.Errorf("Unexpected output: %s != %s", act, exp)
+		}
+	}
+}
+
+func TestSelectPartsIndexBounds(t *testing.T) {
+	conf := NewConfig()
+	conf.SelectParts.Parts = []int{1, 3}
+
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+
+	input := [][]byte{
+		[]byte("0"),
+		[]byte("1"),
+		[]byte("2"),
+		[]byte("3"),
+		[]byte("4"),
+	}
+
+	tests := map[int]string{
+		-5: "0",
+		-4: "1",
+		-3: "2",
+		-2: "3",
+		-1: "4",
+		0:  "0",
+		1:  "1",
+		2:  "2",
+		3:  "3",
+		4:  "4",
+	}
+
+	for i, exp := range tests {
+		conf.SelectParts.Parts = []int{i}
+		proc, err := NewSelectParts(conf, nil, testLog, metrics.DudType{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msgs, res := proc.ProcessMessage(types.NewMessage(input))
+		if len(msgs) != 1 {
+			t.Errorf("Select Parts failed on index: %v", i)
+		} else if res != nil {
+			t.Errorf("Expected nil response: %v", res)
+		}
+		if act := string(msgs[0].GetAll()[0]); exp != act {
+			t.Errorf("Unexpected output for index %v: %v != %v", i, act, exp)
 		}
 	}
 }
@@ -102,15 +148,15 @@ func TestSelectPartsEmpty(t *testing.T) {
 	conf := NewConfig()
 	conf.SelectParts.Parts = []int{3}
 
-	testLog := log.NewLogger(os.Stdout, log.LoggerConfig{LogLevel: "NONE"})
-	proc, err := NewSelectParts(conf, testLog, metrics.DudType{})
+	testLog := log.New(os.Stdout, log.Config{LogLevel: "NONE"})
+	proc, err := NewSelectParts(conf, nil, testLog, metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	_, _, check := proc.ProcessMessage(&types.Message{Parts: [][]byte{[]byte("foo")}})
-	if check {
+	msgs, _ := proc.ProcessMessage(types.NewMessage([][]byte{[]byte("foo")}))
+	if len(msgs) != 0 {
 		t.Error("Expected failure with zero parts selected")
 	}
 }

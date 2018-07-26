@@ -39,23 +39,14 @@ func TestNoneBufferClose(t *testing.T) {
 		return
 	}
 
-	msgChan := make(chan types.Message)
-	resChan := make(chan types.Response)
+	tChan := make(chan types.Transaction)
 
-	if err = empty.StartReceiving(msgChan); err != nil {
+	if err = empty.Consume(tChan); err != nil {
 		t.Error(err)
 		return
 	}
-	if err = empty.StartReceiving(msgChan); err == nil {
+	if err = empty.Consume(tChan); err == nil {
 		t.Error("received nil, expected error from double msg assignment")
-		return
-	}
-	if err = empty.StartListening(resChan); err != nil {
-		t.Error(err)
-		return
-	}
-	if err = empty.StartListening(resChan); err == nil {
-		t.Error("received nil, expected error from double res assignment")
 		return
 	}
 
@@ -68,27 +59,23 @@ func TestNoneBufferClose(t *testing.T) {
 func TestNoneBufferBasic(t *testing.T) {
 	nThreads, nMessages := 5, 100
 
-	empty, err := NewEmpty(NewConfig(), nil, nil)
+	conf := NewConfig()
+	empty, err := NewEmpty(conf, nil, nil)
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	msgChan := make(chan types.Message)
-	resChan := make(chan types.Response)
+	tChan := make(chan types.Transaction)
 
-	if err = empty.StartListening(resChan); err != nil {
-		t.Error(err)
-		return
-	}
-	if err = empty.StartReceiving(msgChan); err != nil {
+	if err = empty.Consume(tChan); err != nil {
 		t.Error(err)
 		return
 	}
 
 	go func() {
-		for msg := range empty.MessageChan() {
-			resChan <- types.NewSimpleResponse(errors.New(string(msg.Parts[0])))
+		for tr := range empty.TransactionChan() {
+			tr.ResponseChan <- types.NewSimpleResponse(errors.New(string(tr.Payload.Get(0))))
 		}
 	}()
 
@@ -98,12 +85,13 @@ func TestNoneBufferBasic(t *testing.T) {
 	for i := 0; i < nThreads; i++ {
 		go func(nThread int) {
 			for j := 0; j < nMessages; j++ {
+				resChan := make(chan types.Response)
 				msg := fmt.Sprintf("Hello World %v %v", nThread, j)
-				msgChan <- types.Message{
-					Parts: [][]byte{[]byte(msg)},
-				}
+				tChan <- types.NewTransaction(types.NewMessage(
+					[][]byte{[]byte(msg)},
+				), resChan)
 				select {
-				case res := <-empty.ResponseChan():
+				case res := <-resChan:
 					if actual := res.Error().Error(); msg != actual {
 						t.Errorf("Wrong result: %v != %v", msg, actual)
 					}
@@ -117,7 +105,7 @@ func TestNoneBufferBasic(t *testing.T) {
 
 	wg.Wait()
 
-	close(msgChan)
+	close(tChan)
 	if err = empty.WaitForClose(time.Second); err != nil {
 		t.Error(err)
 	}

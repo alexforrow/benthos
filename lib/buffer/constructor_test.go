@@ -21,11 +21,13 @@
 package buffer
 
 import (
+	"encoding/json"
 	"os"
+	"reflect"
 	"testing"
 
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 )
 
 func TestConstructorDescription(t *testing.T) {
@@ -38,7 +40,53 @@ func TestConstructorBadType(t *testing.T) {
 	conf := NewConfig()
 	conf.Type = "not_exist"
 
-	if _, err := New(conf, log.NewLogger(os.Stdout, logConfig), metrics.DudType{}); err == nil {
+	if _, err := New(conf, log.New(os.Stdout, logConfig), metrics.DudType{}); err == nil {
 		t.Error("Expected error, received nil for invalid type")
+	}
+}
+
+func TestSanitise(t *testing.T) {
+	var actObj interface{}
+	var act []byte
+	var err error
+
+	exp := `{` +
+		`"type":"none",` +
+		`"none":{}` +
+		`}`
+
+	conf := NewConfig()
+	conf.Type = "none"
+	conf.Mmap.FileSize = 10
+
+	if actObj, err = SanitiseConfig(conf); err != nil {
+		t.Fatal(err)
+	}
+	if act, err = json.Marshal(actObj); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(string(act), exp) {
+		t.Errorf("Wrong sanitised output: %s != %v", act, exp)
+	}
+
+	exp = `{` +
+		`"type":"memory",` +
+		`"memory":{` +
+		`"limit":20` +
+		`}` +
+		`}`
+
+	conf = NewConfig()
+	conf.Type = "memory"
+	conf.Memory.Limit = 20
+
+	if actObj, err = SanitiseConfig(conf); err != nil {
+		t.Fatal(err)
+	}
+	if act, err = json.Marshal(actObj); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(string(act), exp) {
+		t.Errorf("Wrong sanitised output: %s != %v", act, exp)
 	}
 }

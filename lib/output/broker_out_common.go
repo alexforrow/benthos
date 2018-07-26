@@ -21,12 +21,51 @@
 package output
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v2"
 )
+
+//------------------------------------------------------------------------------
+
+type brokerOutputList []Config
+
+// UnmarshalJSON ensures that when parsing configs that are in a map or slice
+// the default values are still applied.
+func (b *brokerOutputList) UnmarshalJSON(bytes []byte) error {
+	genericOutputs := []interface{}{}
+	if err := json.Unmarshal(bytes, &genericOutputs); err != nil {
+		return err
+	}
+
+	inputConfs, err := parseOutputConfsWithDefaults(genericOutputs)
+	if err != nil {
+		return err
+	}
+
+	*b = inputConfs
+	return nil
+}
+
+// UnmarshalYAML ensures that when parsing configs that are in a map or slice
+// the default values are still applied.
+func (b *brokerOutputList) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	genericOutputs := []interface{}{}
+	if err := unmarshal(&genericOutputs); err != nil {
+		return err
+	}
+
+	inputConfs, err := parseOutputConfsWithDefaults(genericOutputs)
+	if err != nil {
+		return err
+	}
+
+	*b = inputConfs
+	return nil
+}
 
 //------------------------------------------------------------------------------
 
@@ -43,16 +82,18 @@ import (
 // formats that we do not know at this stage (JSON, YAML, etc), therefore we use
 // the more hacky method as performance is not an issue at this stage.
 func parseOutputConfsWithDefaults(outConfs []interface{}) ([]Config, error) {
+	type confAlias Config
+
 	outputConfs := []Config{}
 
 	for i, boxedConfig := range outConfs {
-		newConfs := []Config{NewConfig()}
+		newConfs := []confAlias{confAlias(NewConfig())}
 		if i > 0 {
 			// If the type of this output is 'ditto' we want to start with a
 			// duplicate of the previous config.
 			newConfsFromDitto := func(label string) error {
 				// Remove the vanilla config.
-				newConfs = []Config{}
+				newConfs = []confAlias{}
 
 				if len(label) > 5 && label[5] == '_' {
 					if label[6:] == "0" {
@@ -65,10 +106,10 @@ func parseOutputConfsWithDefaults(outConfs []interface{}) ([]Config, error) {
 						return fmt.Errorf("failed to parse ditto multiplier: %v", err)
 					}
 					for j := 0; j < n; j++ {
-						newConfs = append(newConfs, outputConfs[i-1])
+						newConfs = append(newConfs, confAlias(outputConfs[i-1]))
 					}
 				} else {
-					newConfs = append(newConfs, outputConfs[i-1])
+					newConfs = append(newConfs, confAlias(outputConfs[i-1]))
 				}
 				return nil
 			}
@@ -101,7 +142,7 @@ func parseOutputConfsWithDefaults(outConfs []interface{}) ([]Config, error) {
 			if err = yaml.Unmarshal(rawBytes, &conf); err != nil {
 				return nil, err
 			}
-			outputConfs = append(outputConfs, conf)
+			outputConfs = append(outputConfs, Config(conf))
 		}
 	}
 

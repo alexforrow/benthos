@@ -25,43 +25,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Jeffail/benthos/lib/log"
+	"github.com/Jeffail/benthos/lib/metrics"
 	"github.com/Jeffail/benthos/lib/types"
-	"github.com/Jeffail/benthos/lib/util/service/log"
-	"github.com/Jeffail/benthos/lib/util/service/metrics"
 )
 
 func TestMemoryBuffer(t *testing.T) {
 	conf := NewConfig()
 	conf.Type = "memory"
 
-	buf, err := New(conf, log.NewLogger(os.Stdout, logConfig), metrics.DudType{})
+	buf, err := New(conf, log.New(os.Stdout, logConfig), metrics.DudType{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	msgChan, resChan := make(chan types.Message), make(chan types.Response)
+	tChan, resChan := make(chan types.Transaction), make(chan types.Response)
 
-	if err = buf.StartListening(resChan); err != nil {
-		t.Error(err)
-	}
-	if err = buf.StartReceiving(msgChan); err != nil {
+	if err = buf.Consume(tChan); err != nil {
 		t.Error(err)
 	}
 
-	msg := types.NewMessage()
-	msg.Parts = [][]byte{
+	msg := types.NewMessage([][]byte{
 		[]byte(`one`),
 		[]byte(`two`),
-	}
+	})
 
 	select {
-	case msgChan <- msg:
+	case tChan <- types.NewTransaction(msg, resChan):
 	case <-time.After(time.Second):
 		t.Error("Timed out")
 	}
 	select {
-	case res, open := <-buf.ResponseChan():
+	case res, open := <-resChan:
 		if !open {
 			t.Error("buffer closed early")
 		}
@@ -72,18 +68,20 @@ func TestMemoryBuffer(t *testing.T) {
 		t.Error("Timed out")
 	}
 
+	var outTr types.Transaction
+	var open bool
 	select {
-	case msg, open := <-buf.MessageChan():
+	case outTr, open = <-buf.TransactionChan():
 		if !open {
 			t.Error("buffer closed early")
 		}
-		if exp, act := 2, len(msg.Parts); exp != act {
+		if exp, act := 2, outTr.Payload.Len(); exp != act {
 			t.Errorf("Wrong message length: %v != %v", exp, act)
 		} else {
-			if exp, act := `one`, string(msg.Parts[0]); exp != act {
+			if exp, act := `one`, string(outTr.Payload.Get(0)); exp != act {
 				t.Errorf("Wrong message length: %s != %s", exp, act)
 			}
-			if exp, act := `two`, string(msg.Parts[1]); exp != act {
+			if exp, act := `two`, string(outTr.Payload.Get(1)); exp != act {
 				t.Errorf("Wrong message length: %s != %s", exp, act)
 			}
 		}
@@ -91,7 +89,7 @@ func TestMemoryBuffer(t *testing.T) {
 		t.Error("Timed out")
 	}
 	select {
-	case resChan <- types.NewSimpleResponse(nil):
+	case outTr.ResponseChan <- types.NewSimpleResponse(nil):
 	case <-time.After(time.Second):
 		t.Error("Timed out")
 	}
